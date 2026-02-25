@@ -23,7 +23,9 @@ def serialize_type(self) -> Dict:
 
     if isinstance(self, torch.Tensor):
         assert self.dim() == 1, "we can only serialize 1D tensor for now"
+        # 专门针对 Tensor 的优化
         serialized["__type__"] = "Tensor"
+        # 直接获取底层的内存字节，零拷贝（Zero-copy）思想
         serialized["buffer"] = self.numpy().tobytes()
         serialized["dtype"] = str(self.dtype)
         return serialized
@@ -53,6 +55,7 @@ def deserialize_type(cls_map: Dict[str, Type], data: Dict) -> Any:
     type_name = data["__type__"]
     # we can only serialize 1D tensor for now
     if type_name == "Tensor":
+        # 从字节流直接重建 Numpy 数组，再转为 Tensor
         buffer = data["buffer"]
         dtype_str = data["dtype"].replace("torch.", "")
         np_dtype = getattr(np, dtype_str)

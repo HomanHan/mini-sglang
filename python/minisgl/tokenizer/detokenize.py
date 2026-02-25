@@ -64,10 +64,14 @@ class DecodeStatus:
     sent_offset: int  # length of sent out string
 
 
+# Detokenizer 不能简单地把 ID 转为字符，因为存在 Unicode 分词问题
+# （比如一个汉字可能由 3 个 Token 组成，只收到前 2 个时是乱码）
 class DetokenizeManager:
     def __init__(self, tokenizer: LlamaTokenizer) -> None:
         # uid -> DecodeStatus
-        self.decode_map: Dict[int, DecodeStatus] = {}
+        self.decode_map: Dict[int, DecodeStatus] = (
+            {}
+        )  # 维护解码状态，已解码的 ID、已发送的字符串偏移量等
         self.tokenizer = tokenizer
         self.eos_token_id = self.tokenizer.eos_token_id
 
@@ -89,12 +93,14 @@ class DetokenizeManager:
             read_ids.append(s.decoded_ids[s.surr_offset :])
             surr_ids.append(s.decoded_ids[s.surr_offset : s.read_offset])
 
-        read_texts = self.tokenizer.batch_decode(read_ids)
+        # 同时解码“当前所有 ID” (read_ids) 和“上一轮所有 ID” (surr_ids)
+        read_texts = self.tokenizer.batch_decode(read_ids)  # batch decode
         surr_texts = self.tokenizer.batch_decode(surr_ids)
 
         incremental_strs: List[str] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
             s = self.decode_map[msg.uid]
+            # 通过字符串比对 (read_str[len(surr_str):]) 来找出新增的文本
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status
             if len(new_text) > 0 and not new_text.endswith("�"):

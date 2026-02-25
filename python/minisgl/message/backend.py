@@ -8,7 +8,7 @@ from minisgl.core import SamplingParams
 
 from .utils import deserialize_type, serialize_type
 
-
+# 定义 Scheduler(Backend) 和 Tokenizer 之间通信的消息格式。
 @dataclass
 class BaseBackendMsg:
     def encoder(self) -> Dict:

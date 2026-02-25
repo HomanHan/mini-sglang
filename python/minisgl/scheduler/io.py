@@ -22,6 +22,10 @@ class SchedulerIOMixin:
         receive_msg: Function to receive messages from the tokenizer.
         send_result: Function to send results back to the tokenizer.
         sync_all_ranks: Function to synchronize all ranks on CPU side.
+
+    Rank 0 负责通信: 在多卡(Tensor Parallel)模式下, 只有 Rank 0 负责与外界(Tokenizer)通信，
+        然后通过 NCCL/广播 同步给其他 Rank。
+        这避免了多卡同时抢占 ZMQ 端口的问题。
     """
 
     def __init__(self, config: SchedulerConfig, tp_cpu_group: torch.distributed.ProcessGroup):
@@ -33,6 +37,8 @@ class SchedulerIOMixin:
             return  # early exit
 
         if tp_info.is_primary():
+            # 只有主进程 (Rank 0) 负责从 ZMQ 接收消息
+            # 初始化两个 ZMQ 队列
             self._recv_from_tokenizer: Final = ZmqPullQueue(
                 config.zmq_backend_addr,
                 create=True,
@@ -76,11 +82,15 @@ class SchedulerIOMixin:
     def sync_all_ranks(self) -> None:
         self.tp_cpu_group.barrier().wait()
 
+    # 接收消息的入口
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
+        # 如果需要阻塞等待 (blocking=True)，则先尝试 get()
         if blocking:
-            self.run_when_idle()
+            self.run_when_idle()  # 这是一个钩子，可以在等待时做点别的
             pending_msgs.append(self._recv_from_tokenizer.get())
+
+        # 非阻塞地把队列里剩下的都取出来，一次性取空队列
         while not self._recv_from_tokenizer.empty():
             pending_msgs.append(self._recv_from_tokenizer.get())
         return pending_msgs

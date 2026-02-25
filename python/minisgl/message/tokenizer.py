@@ -12,7 +12,7 @@ from .utils import deserialize_type, serialize_type
 class BaseTokenizerMsg:
     @staticmethod
     def encoder(msg: BaseTokenizerMsg) -> Dict:
-        return serialize_type(msg)
+        return serialize_type(msg)  # ZMQ 传输字节流，要求对象必须序列化
 
     @staticmethod
     def decoder(json: Dict) -> BaseTokenizerMsg:
@@ -25,17 +25,17 @@ class BatchTokenizerMsg(BaseTokenizerMsg):
 
 
 @dataclass
-class DetokenizeMsg(BaseTokenizerMsg):
+class DetokenizeMsg(BaseTokenizerMsg):  # id -> text
     uid: int
-    next_token: int
+    next_token: int  # 只有一个整数 ID
     finished: bool
 
 
 @dataclass
-class TokenizeMsg(BaseTokenizerMsg):
+class TokenizeMsg(BaseTokenizerMsg): # text -> id
     uid: int
-    text: str | List[Dict[str, str]]
-    sampling_params: SamplingParams
+    text: str | List[Dict[str, str]]  # 原始文本(str) 或 对话历史(dict)
+    sampling_params: SamplingParams  # 采样参数
 
 
 @dataclass

@@ -99,11 +99,17 @@ class ModelList(BaseModel):
 @dataclass
 class FrontendManager:
     config: ServerArgs
+    # 两个 ZMQ 队列：一个发给 Tokenizer，一个从 Tokenizer 收
     send_tokenizer: ZmqAsyncPushQueue[BaseTokenizerMsg]
     recv_tokenizer: ZmqAsyncPullQueue[BaseFrontendMsg]
+
+    # 关键状态管理
+    # uid_counter: 为每个请求生成唯一 ID
     uid_counter: int = 0
     initialized: bool = False
+    # ack_map: 存储收到的结果。Key 是 uid，Value 是结果列表
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
+    # event_map: 异步通知机制。Key 是 uid，Value 是 asyncio.Event
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
 
     def new_user(self) -> int:
@@ -113,12 +119,16 @@ class FrontendManager:
         self.event_map[uid] = asyncio.Event()
         return uid
 
+    # 监听结果（后台循环）
     async def listen(self):
         while True:
+            # 从 ZMQ 拉取消息 (这里会 await 直到有消息)
             msg = await self.recv_tokenizer.get()
             for msg in _unwrap_msg(msg):
+                # 收到消息后，放入对应的 ack_map
                 assert msg.uid in self.ack_map
                 self.ack_map[msg.uid].append(msg)
+                # 触发 Event，唤醒等待该 uid 的协程（wait_for_ack...）
                 self.event_map[msg.uid].set()
 
     def _create_listener_once(self):
@@ -126,25 +136,33 @@ class FrontendManager:
             asyncio.create_task(self.listen())
             self.initialized = True
 
+    # 发送请求
     async def send_one(self, msg: BaseTokenizerMsg):
         self._create_listener_once()
         await self.send_tokenizer.put(msg)
 
+    # 等待结果逻辑 (流式响应的核心)
     async def wait_for_ack(self, uid: int):
         event = self.event_map[uid]
 
         while True:
+            # 等待 listen() 函数触发 Event
             await event.wait()
-            event.clear()
+            event.clear()  # 清除标志，为下一次等待做准备
 
+            # 取出所有积压的结果
             pending = self.ack_map[uid]
             self.ack_map[uid] = []
+
             ack = None
+            # Drain this batch and keep the last ack to check completion.
             for ack in pending:
-                yield ack
+                yield ack   # 异步流式输出 ack，每次执行到 yield 会暂停函数状态并输出
+            # If the last ack marks the end, stop waiting.
             if ack and ack.finished:
                 break
-
+        
+        # 清理资源
         del self.ack_map[uid]
         del self.event_map[uid]
 
@@ -208,7 +226,7 @@ async def lifespan(_: FastAPI):
         _GLOBAL_STATE.shutdown()
 
 
-app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
+app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)  # 定义 FastAPI 应用
 
 
 @app.post("/generate")
@@ -413,7 +431,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], None], run_sh
     port = config.server_port
 
     assert _GLOBAL_STATE is None, "Global state is already initialized"
-    _GLOBAL_STATE = FrontendManager(
+    _GLOBAL_STATE = FrontendManager(  # 一个前端的全局变量，存储了配置信息（port/host...），以及发送和接收 tokenizer 消息的 ZMQ 队列
         config=config,
         recv_tokenizer=ZmqAsyncPullQueue(
             config.zmq_frontend_addr,
