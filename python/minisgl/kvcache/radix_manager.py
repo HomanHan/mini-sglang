@@ -59,8 +59,10 @@ class RadixTreeNode:
         from minisgl.kernel import fast_compare_key
 
         # compare key and input_ids, find the first diff
-        return fast_compare_key(self._key, input_ids)
+        return fast_compare_key(self._key, input_ids)   # 调用一个 CUDA kernel 快速比较 _key 和输入序列，找到第一处不同的位置
 
+    # 新建一个中间节点 new_node，把原节点的前 pos 个 token/indices 挪到 new_node 上
+    # 再把原节点带着剩余的后半段挂到 new_node 下面
     def _split_at(self, pos: int) -> RadixTreeNode:
         assert 0 < pos < self.length
         parent = self.parent
@@ -84,6 +86,9 @@ class RadixCacheHandle(BaseCacheHandle):
     node: RadixTreeNode
 
 
+# Radix 的匹配不是一 token 一节点的 trie，而是“压缩过的 trie”：
+#   每个节点的 _key 可能是一段 token 序列，因此匹配时需要计算“这一段 key 和输入序列能匹配多长”
+#   如果只匹配了前半段，就必须把节点从中间切开（split）再返回，这样树才能继续保持正确结构
 class RadixCacheManager(BaseCacheManager):
     def __init__(self, device: torch.device):
         self.device = device
@@ -94,6 +99,8 @@ class RadixCacheManager(BaseCacheManager):
         self.evictable_size = 0
         self.protected_size = 0
 
+    # Radix 只允许驱逐 ref_count == 0 的节点，因此当某个请求命中了树上的一段前缀，这段前缀以及它的祖先路径必须被“lock”
+    # 下面这个函数通过沿父指针一路向上修改 ref_count 来实现 lock/unlock 的功能，同时维护 evictable_size/protected_size
     def lock_handle(self, handle: BaseCacheHandle, unlock: bool = False) -> None:
         assert isinstance(handle, RadixCacheHandle)
         node = handle.node
@@ -136,6 +143,8 @@ class RadixCacheManager(BaseCacheManager):
             self.evictable_size += new_node.length
         return prefix_len
 
+    # 沿着 children 走树，遇到三种情况就停：
+    #   下一 token 没有子节点、节点只部分匹配需要 split、或者完整走完输入序列。
     def _walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
         prefix_len = 0
         indice_len = len(input_ids)
@@ -163,6 +172,9 @@ class RadixCacheManager(BaseCacheManager):
 
         return node, prefix_len
 
+    # 两条硬约束：只能驱逐 ref_count == 0 的节点，优先驱逐叶子节点（防止破坏其他前缀路径）
+    # 在满足约束的候选集合里，它用 timestamp 做 LRU
+    # 逻辑：先收集候选叶子节点，建一个最小堆（按 timestamp），然后循环弹出最旧节点作为“受害者”，把节点对应的物理页索引 node.value 拼接起来返回
     def evict(self, size: int) -> torch.Tensor:
         if size == 0:
             return self.empty_tensor
@@ -182,16 +194,17 @@ class RadixCacheManager(BaseCacheManager):
             node = heapq.heappop(leave_nodes)
             assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
             evicted_size += node.length
-            evicted_indices.append(node.value)
+            evicted_indices.append(node.value)  # value 存 token 前缀对应的 page ids，驱逐的直接收益就是把这些 page ids 交还给上层重新分配
             self.evictable_size -= node.length
             parent = node.parent
-            del parent.children[int(node._key[0].item())]
+            del parent.children[int(node._key[0].item())]   # 从父节点的 children 里移除这个叶子，等价于把这段前缀从 cache 里彻底删除
             # NOTE: root is always protected, so won't be evicted
-            if parent.is_leaf() and parent.ref_count == 0:
+            if parent.is_leaf() and parent.ref_count == 0:  # 删掉叶子后，父节点可能变成新的叶子；如果父节点也没人引用，就把它加入候选集合，允许“向上连锁合并式地清理”
                 heapq.heappush(leave_nodes, parent)
 
         return torch.cat(evicted_indices)
 
+    # 做一次 DFS，把所有叶子节点中 ref_count == 0 的收集出来，以备 evict
     def _collect_leave_nodes_for_evict(self) -> List[RadixTreeNode]:
         nodes: List[RadixTreeNode] = [self.root_node]
         leave_nodes: List[RadixTreeNode] = []

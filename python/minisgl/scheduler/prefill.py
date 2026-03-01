@@ -39,18 +39,20 @@ class PrefillAdder:
         if self.table_manager.available_size == 0:
             return None
 
-        handle, match_indices = self.cache_manager.match_req(req)
+        handle, match_indices = self.cache_manager.match_req(req)   # 命中了多长的前缀（handle.cached_len），以及命中前缀对应的 KV pages 在哪里（match_indices）
         cached_len = handle.cached_len
         # TODO: better estimate policy
+        # 在把请求塞进 batch 之前，先估算“这轮算上它之后，KV pages 够不够”，不够就先不收这个请求
         extend_len = req.input_len - cached_len
         estimated_len = extend_len + req.output_len
 
-        if estimated_len + self.reserved_size > self.cache_manager.available_size:
+        if estimated_len + self.reserved_size > self.cache_manager.available_size:  # reserved_size: 把正在 decode 的in-flight token 也加上
             return None
-        self.cache_manager.lock(handle)
+        self.cache_manager.lock(handle) # 将匹配到的前缀 lock，同时也会更新 available_size（因为 lock 可能会把一些之前 evictable 的节点转成 protected）
         if estimated_len + self.reserved_size > self.cache_manager.available_size:
             return self.cache_manager.unlock(handle)
 
+        # 将可以复用的 ids 写入 page table 
         table_idx = self.table_manager.allocate()
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]

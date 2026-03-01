@@ -56,6 +56,7 @@ def launch_server(run_shell: bool = False) -> None:
         # so that we can guarantee all subprocesses are ready
         ack_queue: mp.Queue[str] = mp.Queue()
 
+        # 启动 world_size 个 scheduler
         for i in range(world_size):
             new_args = replace(
                 server_args,
@@ -85,6 +86,8 @@ def launch_server(run_shell: bool = False) -> None:
             daemon=False,
             name="minisgl-detokenizer-0",
         ).start()
+
+        # 启动 num_tokenizers 个 Tokenizer
         for i in range(num_tokenizers):
             mp.Process(
                 target=tokenize_worker,

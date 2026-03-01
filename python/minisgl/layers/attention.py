@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from minisgl.layers import RMSNorm
     from minisgl.models import RotaryConfig
 
-
+# FlashAttention/FlashInfer 后端
 class AttentionLayer(StateLessOP):
     def __init__(
         self,

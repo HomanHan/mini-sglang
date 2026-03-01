@@ -40,14 +40,17 @@ class ForwardInput(NamedTuple):
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
-
+# Scheduler 的核心职责只是调度和执行请求，主要包括以下几个方面：
+#   本轮推理执行 Prefill（前缀填充）还是 Decode（增量解码）
+#   为当前批次请求分配多少 KV pages
+#   请求结束后，如何将其 KV 数据转化为可复用的前缀缓存
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from minisgl.engine import Engine
 
-        self.engine = Engine(config)
+        self.engine = Engine(config)    # 关联 Engine
         # Initialize the I/O mixin
-        super().__init__(config, self.engine.tp_cpu_group)
+        super().__init__(config, self.engine.tp_cpu_group) # 继承 SchedulerIOMixin，封装通信逻辑，包括 rank0 节点对外收发消息、多 TP 节点间的广播同步
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
@@ -57,7 +60,8 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-        self.cache_manager = CacheManager(self.device, self.engine.num_pages, config.cache_type)
+        self.cache_manager = CacheManager(self.device, self.engine.num_pages, config.cache_type)    # KV 页的分配、复用与驱逐
+        # 将请求打包成 Batch
         self.decode_manager = DecodeManager()
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
@@ -67,7 +71,7 @@ class Scheduler(SchedulerIOMixin):
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_path)
         self.eos_token_id = self.tokenizer.eos_token_id
-        self.page_table = self.engine.page_table
+        self.page_table = self.engine.page_table    # GPU 侧请求状态
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
         self.dummy_write_2d_pos = (self.engine.dummy_req.table_idx, 1, 2)  # 0 for load, 1 for write
@@ -86,7 +90,7 @@ class Scheduler(SchedulerIOMixin):
                 continue
 
             next_token_id = next_tokens_cpu[i]
-            req.append_host(next_token_id.unsqueeze(0))
+            req.append_host(next_token_id.unsqueeze(0)) # 将增量 Decode 得到的后续 token 回写到 cpu 侧的请求里
             next_token = int(next_token_id.item())
             finished = not req.can_decode()
             if not req.sampling_params.ignore_eos:
@@ -113,6 +117,7 @@ class Scheduler(SchedulerIOMixin):
         self.finished_reqs.intersection_update(ongoing_reqs)
         self.send_result(reply)
 
+    # 处理来自 Tokenizer 的消息，并加入 Prefill manager 的 pending_list 队列中等待处理
     def _process_one_msg(self, msg: BaseBackendMsg) -> None:
         if isinstance(msg, BatchBackendMsg):
             for msg in msg.data:
@@ -139,11 +144,13 @@ class Scheduler(SchedulerIOMixin):
             raise NotImplementedError
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        needed_size = sum(r.extend_len for r in batch.reqs)
-        batch.out_loc = self.cache_manager.allocate(needed_size)
+        needed_size = sum(r.extend_len for r in batch.reqs) # 汇总 batch 中所有的需求 size
+        batch.out_loc = self.cache_manager.allocate(needed_size)    # 分配 KV pages，顺序 free_slots => evict
         # NOTE: Pad the batch if needed
         if padding_size := self.engine.graph_runner.pad_batch(batch):
             batch.out_loc = F.pad(batch.out_loc, (0, padding_size), value=self.engine.dummy_page)
+        
+        # ？？？
         # NOTE: prepare 2d indices for token ids loading and writing
         load_indices = self._make_2d_indices(
             [(r.table_idx, r.cached_len, r.device_len) for r in batch.padded_reqs]
@@ -161,7 +168,11 @@ class Scheduler(SchedulerIOMixin):
         assert all(r.device_len < self.engine.max_seq_len for r in batch.reqs)
         # NOTE: write out_loc to page_table before `prepare_metadata`
         self.page_table.view(-1)[load_indices] = batch.out_loc
+
+        # ？？？
         self.engine.attn_backend.prepare_metadata(batch)
+
+        # 为什么 ForwardInput 中定义属性都是类属性？
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
@@ -171,6 +182,7 @@ class Scheduler(SchedulerIOMixin):
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
+        # Prefill 优先
         batch = (
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
@@ -242,17 +254,17 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
         )
-        for msg in self.receive_msg(blocking=blocking):
+        for msg in self.receive_msg(blocking=blocking): # 通过 receive_msg 接收新请求，这是持续批处理 Continuous batching 的基础
             self._process_one_msg(msg)
 
-        forward_input = self._schedule_next_batch()
+        forward_input = self._schedule_next_batch() # _schedule_next_batch 组装下一轮执行的 batch
         ongoing_data = None
-        if forward_input is not None:
+        if forward_input is not None:   # batch 就绪，就在 Engine Stream 提交 _forward 任务，GPU 开始执行本轮计算
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
                 ongoing_data = (forward_input, self._forward(forward_input))
 
-        self._process_last_data(last_data, ongoing_data)
+        self._process_last_data(last_data, ongoing_data)    # GPU 运算的同时，CPU 立刻回头执行 _process_last_data，处理上一轮的输出 token（判断请求是否结束、向上游回包，同时回收已结束请求的资源，并将其 KV 数据回填缓存）
         return ongoing_data
 
     def normal_loop(self) -> None:

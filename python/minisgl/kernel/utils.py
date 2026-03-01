@@ -49,7 +49,7 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CppArgList:
 
     return CppArgList(_convert(arg) for arg in args)
 
-
+# TVM-FFI 在这里提供了两种调用路径：AOT（静态编译，适合 radix compare 这类固定实现）和 JIT（按参数动态生成，比如 indexing/store）
 def load_aot(
     *args: str,
     cpp_files: List[str] | None = None,

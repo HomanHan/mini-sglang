@@ -10,7 +10,7 @@ from minisgl.utils import div_ceil, nvtx_annotate
 
 from .base import BaseOP
 
-
+# Vocab Parallel：每个 rank 只保存一段词表，lookup 时通过内核做 indexing，再做 all-reduce；而 lm_head 则通过 all-gather 拼接 logits
 class VocabParallelEmbedding(BaseOP):
     def __init__(
         self,
@@ -33,7 +33,7 @@ class VocabParallelEmbedding(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from minisgl.kernel import indexing
 
-        y = indexing(
+        y = indexing(   # 不用 torch.index_select
             weights=self.weight,
             indices=x,
             vocab_range=self.vocab_range if self.tp_size > 1 else None,

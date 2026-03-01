@@ -9,6 +9,8 @@ from minisgl.utils import div_even
 
 from .base import BaseOP
 
+# Column Parallel、Row Parallel、QKV merged 三种策略
+# 没有直接使用 PyTorch 的分布式 API，而是封装了 DistributedCommunicator
 
 class _LinearTPImpl(BaseOP):
     """Real implementation of a linear layer with tensor parallelism."""

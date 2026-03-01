@@ -66,6 +66,9 @@ class SchedulerIOMixin:
                     create=False,
                     decoder=BaseBackendMsg.decoder,
                 )
+        # tp = 1: recv = _recv_msg_single_rank, send = _reply_tokenizer_rank0
+        # tp > 1: rank0 recv = _recv_msg_multi_rank0, send = _reply_tokenizer_rank0
+        # tp > 1: rank1/2/3/... recv = _recv_msg_multi_rank1, send = _reply_tokenizer_rank1(do nothing)
 
         self.receive_msg = recv
         self.send_result = send
@@ -95,6 +98,7 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_tokenizer.get())
         return pending_msgs
 
+    # _recv_msg_single_rank + 广播给其他 Rank
     def _recv_msg_multi_rank0(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
@@ -116,6 +120,7 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_tokenizer.decode(raw))
         return pending_msgs
 
+    # 从 Rank 0 的广播队列接收消息
     def _recv_msg_multi_rank1(self, blocking: bool = False) -> List[BaseBackendMsg]:
         pending_msgs: List[BaseBackendMsg] = []
         if blocking:
@@ -131,6 +136,8 @@ class SchedulerIOMixin:
             pending_msgs.append(self._recv_from_rank0.get())
         return pending_msgs
 
+    # 回复消息的入口 (仅 Rank 0 负责发送)
+    # reply 的内容以参数形式传入，SchedulerIOMixin 不关心 reply 是如何生成的，只负责接收/发送/通信的部分
     def _reply_tokenizer_rank0(self, reply: List[DetokenizeMsg]) -> None:
         num_reply = len(reply)
         logger.debug_rank0(f"Replying to tokenizer: {num_reply} messages")
