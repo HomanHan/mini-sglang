@@ -107,7 +107,7 @@ class Scheduler(SchedulerIOMixin):
         ongoing_reqs = ongoing_data[0].batch.reqs if ongoing_data else []
         for req in self.finished_reqs.difference(ongoing_reqs):
             self.table_manager.free(req.table_idx)
-            self.cache_manager.free_and_cache_finished_req(
+            self.cache_manager.free_and_cache_finished_req( # 回填到 RadixTree
                 req.cache_handle,
                 req.input_ids[: req.cached_len],
                 self.page_table[req.table_idx, : req.cached_len],
@@ -150,11 +150,14 @@ class Scheduler(SchedulerIOMixin):
         if padding_size := self.engine.graph_runner.pad_batch(batch):
             batch.out_loc = F.pad(batch.out_loc, (0, padding_size), value=self.engine.dummy_page)
         
-        # ？？？
+        # 将新 allocate 的 KV Page 转成 1D indices 取出索引，方便读取
         # NOTE: prepare 2d indices for token ids loading and writing
+        # device_len 是当前请求在设备端“已占用的序列长度”
         load_indices = self._make_2d_indices(
             [(r.table_idx, r.cached_len, r.device_len) for r in batch.padded_reqs]
         )
+        # 将下一个要写入的 KV Page 位置也转成 1D indices，方便 Decode 后写回
+        # dummy_write_2d_pos 是给不应写真实位置的请求（chunk...）准备的“哑元写回位置）
         write_indices = self._make_2d_indices(
             [
                 (
@@ -167,12 +170,11 @@ class Scheduler(SchedulerIOMixin):
         )
         assert all(r.device_len < self.engine.max_seq_len for r in batch.reqs)
         # NOTE: write out_loc to page_table before `prepare_metadata`
-        self.page_table.view(-1)[load_indices] = batch.out_loc
+        self.page_table.view(-1)[load_indices] = batch.out_loc # 把新分配的 page id 写入 page_table
 
         # ？？？
         self.engine.attn_backend.prepare_metadata(batch)
 
-        # 为什么 ForwardInput 中定义属性都是类属性？
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
@@ -189,6 +191,7 @@ class Scheduler(SchedulerIOMixin):
         )
         return self._prepare_batch(batch) if batch else None
 
+    # 把 2D indices 内容拿出来 1D
     def _make_2d_indices(self, ranges: List[Tuple[int, int, int]]) -> torch.Tensor:
         """
         Return the 1D indices for the given 2D table and ranges.
@@ -234,7 +237,7 @@ class Scheduler(SchedulerIOMixin):
             self.stream.synchronize()
         forward_output = self.engine.forward_batch(batch, sample_args)
         self._write_token_ids(forward_input, forward_output)
-        self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        self.decode_manager.filter_reqs(forward_input.batch.reqs) # Prefill 之后仍然要 Decode 的请求转到 DecodeManager 管理
         return forward_output
 
     def run_when_idle(self) -> None:
