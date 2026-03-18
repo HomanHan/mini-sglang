@@ -34,6 +34,7 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
+    attn_output_gate: bool
 
     @classmethod
     def from_hf(cls, config: LlamaConfig) -> ModelConfig:
@@ -46,6 +47,7 @@ class ModelConfig:
         moe_intermediate_size = getattr(config, "moe_intermediate_size", 0)
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
+        attn_output_gate = getattr(config, "attn_output_gate", False)
 
         return cls(
             num_layers=config.num_hidden_layers,
@@ -71,4 +73,5 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            attn_output_gate=attn_output_gate,
         )
