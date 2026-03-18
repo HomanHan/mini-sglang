@@ -32,7 +32,7 @@ We recommend using `uv` for a fast and reliable installation (note that `uv` doe
 
 ```bash
 # Create a virtual environment (Python 3.10+ recommended)
-uv venv --python=3.12
+uv venv --python=3.12 --seed
 source .venv/bin/activate
 ```
 
@@ -43,9 +43,11 @@ source .venv/bin/activate
 Install Mini-SGLang directly from the source:
 
 ```bash
-git clone https://github.com/sgl-project/mini-sglang.git
-cd mini-sglang && uv venv --python=3.12 && source .venv/bin/activate
-uv pip install -e .
+git clone git@github.com:HomanHan/mini-sglang.git
+cd mini-sglang
+
+# For GB200 CUDA 13.0 users, install PyTorch with CUDA 13.0 GPU support
+uv pip install -e . --extra-index-url https://download.pytorch.org/whl/cu130
 ```
 
 <details>
