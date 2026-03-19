@@ -47,7 +47,10 @@ git clone git@github.com:HomanHan/mini-sglang.git
 cd mini-sglang
 
 # For GB200 CUDA 13.0 users, install PyTorch with CUDA 13.0 GPU support
-uv pip install -e . --extra-index-url https://download.pytorch.org/whl/cu130
+uv pip install -e .
+pip uninstall torch -y
+uv pip install torch --index-url https://download.pytorch.org/whl/cu130
+python -c "import torch; print(torch.cuda.is_available());" # True
 ```
 
 <details>

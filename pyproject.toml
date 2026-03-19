@@ -24,17 +24,18 @@ classifiers = [
 dependencies = [
     "accelerate",
     "msgpack",
-    "sglang-kernel==0.4.0",
-    "torch==2.9.1+cu130",
-    "transformers==4.57.1",
-    "flashinfer_python==0.6.6",
+    "modelscope",
+    "torch<2.10.0",
+    "transformers>=4.56.0,<=4.57.3",
+    "flashinfer-python>=0.5.3",
     "pyzmq",
     "uvicorn",
     "fastapi",
     "prompt_toolkit",
     "openai",
-    "apache-tvm-ffi>=0.1.5,<0.2",
-    "nvidia-cutlass-dsl>=4.4.1",
+    "apache-tvm-ffi>=0.1.4",
+    "sgl_kernel>=0.3.17.post1",
+    "quack-kernels",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +48,7 @@ dev = [
     "pre-commit>=3.0.0",
     "ruff>=0.11.0",
     "matplotlib>=3.10.5",
+    "pyarrow",
 ]
 
 [tool.setuptools]
