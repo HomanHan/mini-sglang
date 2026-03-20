@@ -219,6 +219,7 @@ class Qwen3_5AttentionDecoderLayer(BaseOP):
         if rope_scaling and not ("rope_type" in rope_scaling or "type" in rope_scaling):
             rope_scaling = None
 
+        # get rope config using sglang utility
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             rotary_dim=self.head_dim,
@@ -233,6 +234,7 @@ class Qwen3_5AttentionDecoderLayer(BaseOP):
         # Gated Attention
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
 
+        # qkv projection
         self.qkv_proj = LinearQKVMerged(
             hidden_size=config.hidden_size,
             head_dim=self.head_dim,
@@ -241,14 +243,18 @@ class Qwen3_5AttentionDecoderLayer(BaseOP):
             has_bias=False,
         )
 
+        # Output projection
         self.o_proj = LinearOProj(
             input_size=self.head_dim * self.total_num_heads,
             output_size=config.hidden_size,
             has_bias=False,
         )
 
+        # Normalization layers
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        # Attention layer, with RadixAttention & PagedAttention & Attention Backend
         self.self_attn = AttentionLayer(  # need to pass rope
             num_qo_heads=self.total_num_heads,
             num_kv_heads=self.total_num_kv_heads,
