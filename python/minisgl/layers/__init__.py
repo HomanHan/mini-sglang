@@ -8,6 +8,7 @@ from .linear import (
     LinearQKVMerged,
     LinearReplicated,
     LinearRowParallel,
+    LinearColParallel,
 )
 from .moe import MoELayer
 from .norm import GemmaRMSNorm, GemmaRMSNormFused, RMSNorm, RMSNormFused
@@ -26,6 +27,7 @@ __all__ = [
     "LinearRowParallel",
     "LinearOProj",
     "LinearQKVMerged",
+    "LinearColParallel",
     "RMSNorm",
     "RMSNormFused",
     "GemmaRMSNorm",

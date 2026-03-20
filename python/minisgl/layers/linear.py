@@ -12,6 +12,7 @@ from .base import BaseOP
 # Column Parallel、Row Parallel、QKV merged 三种策略
 # 没有直接使用 PyTorch 的分布式 API，而是封装了 DistributedCommunicator
 
+
 class _LinearTPImpl(BaseOP):
     """Real implementation of a linear layer with tensor parallelism."""
 
@@ -126,4 +127,26 @@ class LinearRowParallel(_LinearTPImpl):
         y = F.linear(x, self.weight, self.bias)
         if self._tp_size > 1:
             y = self._comm.all_reduce(y)
+        return y
+
+
+class LinearColParallel(_LinearTPImpl):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        has_bias: bool,
+    ):
+        tp_info = get_tp_info()
+        local_input_size = input_size
+        local_output_size = div_even(output_size, tp_info.size)
+        self._comm = DistributedCommunicator()
+        self._tp_size = tp_info.size
+        super().__init__(input_size, output_size, local_input_size, local_output_size, has_bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = F.linear(x, self.weight, self.bias)
+        if self._tp_size > 1:
+            y = self._comm.all_gather(y)
+            y = y.view(x.size(0), -1)
         return y

@@ -50,6 +50,35 @@ class GatedMLP(BaseOP):
         return self.down_proj.forward(y)
 
 
+class Qwen2MoeMLP(BaseOP):
+    def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str):
+        self.gate_up_proj = LinearColParallelMerged(
+            hidden_size,
+            [intermediate_size, intermediate_size],
+            has_bias=False,
+        )
+
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+            )
+        self.act_fn = silu_and_mul
+
+        self.down_proj = LinearRowParallel(
+            intermediate_size,
+            hidden_size,
+            has_bias=False,
+        )
+
+    @nvtx_annotate("MLP")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj.forward(x)
+        del x
+        y = self.act_fn(gate_up)
+        del gate_up
+        return self.down_proj.forward(y)
+
+
 class MoEMLP(BaseOP):
     def __init__(self, config: ModelConfig):
         self.experts = MoELayer(

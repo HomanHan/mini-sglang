@@ -11,8 +11,10 @@ from .base import StateLessOP
 from .rotary import get_rope
 
 if TYPE_CHECKING:
-    from minisgl.layers import RMSNorm
+    from minisgl.layers import RMSNorm, GemmaRMSNorm
     from minisgl.models import RotaryConfig
+    from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+
 
 # FlashAttention/FlashInfer 后端
 class AttentionLayer(StateLessOP):
@@ -22,9 +24,10 @@ class AttentionLayer(StateLessOP):
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
-        rotary_config: RotaryConfig,
-        q_norm: RMSNorm | None = None,
-        k_norm: RMSNorm | None = None,
+        rotary_config: RotaryConfig | None = None,
+        rotary_emb: RotaryEmbedding | None = None,
+        q_norm: RMSNorm | GemmaRMSNorm | None = None,
+        k_norm: RMSNorm | GemmaRMSNorm | None = None,
     ):
         assert num_qo_heads % num_kv_heads == 0
         self.layer_id = layer_id
@@ -34,13 +37,18 @@ class AttentionLayer(StateLessOP):
         self.num_kv_heads = div_even(num_kv_heads, tp_size)
         self.qo_attn_dim = self.num_qo_heads * head_dim
         self.kv_attn_dim = self.num_kv_heads * head_dim
-        self.rotary = get_rope(
-            head_dim=head_dim,
-            rotary_dim=rotary_config.rotary_dim,
-            max_position=rotary_config.max_position,
-            base=rotary_config.base,
-            rope_scaling=tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
-        )
+        
+        if rotary_emb is not None:
+            self.rotary = rotary_emb
+        elif rotary_config is not None:
+            self.rotary = get_rope(
+                head_dim=head_dim,
+                rotary_dim=rotary_config.rotary_dim,
+                max_position=rotary_config.max_position,
+                base=rotary_config.base,
+                rope_scaling=tuple(rotary_config.scaling.items()) if rotary_config.scaling else None,
+            )
+
         self.q_norm = q_norm
         self.k_norm = k_norm
 
@@ -57,3 +65,4 @@ class AttentionLayer(StateLessOP):
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         return o.view(-1, self.qo_attn_dim)
+
