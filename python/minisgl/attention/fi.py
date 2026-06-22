@@ -6,12 +6,13 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Dict, List, Literal
 
 import torch
+from minisgl.core import Batch, get_global_ctx
 from minisgl.distributed import get_tp_info
 from minisgl.env import ENV
 from minisgl.utils import div_even, init_logger
 
 from .base import BaseAttnBackend, BaseAttnMetadata
-from .utils import BaseCaptureData, make_positions
+from .utils import BaseCaptureData
 
 if TYPE_CHECKING:
     from flashinfer import (
@@ -19,8 +20,6 @@ if TYPE_CHECKING:
         BatchPrefillWithPagedKVCacheWrapper,
         CUDAGraphBatchDecodeWithPagedKVCacheWrapper,
     )
-    from minisgl.core import Batch
-    from minisgl.kvcache import BaseKVCache
     from minisgl.models import ModelConfig
 
 
@@ -66,8 +65,7 @@ class FIMetadata(BaseAttnMetadata):
     def __post_init__(self) -> None:
         assert self.page_size == 1, "Currently only page_size=1 is supported."
         assert (
-            self.positions.is_cuda
-            and self.cu_seqlens_k_cpu.is_cpu
+            self.cu_seqlens_k_cpu.is_cpu
             and self.cu_seqlens_q_cpu.is_cpu
             and self.cu_seqlens_q_gpu.is_cuda
             and self.indices.is_cuda
@@ -75,28 +73,20 @@ class FIMetadata(BaseAttnMetadata):
             and self.seq_lens_cpu.is_cpu
         )
 
-    def get_positions(self) -> torch.Tensor:
-        return self.positions
-
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.cu_seqlens_q_gpu[1 : 1 + bs] - 1
 
 
 class FlashInferBackend(BaseAttnBackend):
-    def __init__(
-        self,
-        config: ModelConfig,
-        kvcache: BaseKVCache,
-        page_table: torch.Tensor,
-    ) -> None:
+    def __init__(self, config: ModelConfig) -> None:
         from flashinfer import (
             BatchDecodeWithPagedKVCacheWrapper,
             BatchPrefillWithPagedKVCacheWrapper,
         )
 
         self.config = config
-        self.kvcache = kvcache
-        self.device = kvcache.device
+        self.kvcache = get_global_ctx().kv_cache
+        self.device = self.kvcache.device
         self.float_workspace_buffer = torch.empty(
             128 * 1024 * 1024, dtype=torch.uint8, device=self.device
         )
@@ -119,7 +109,7 @@ class FlashInferBackend(BaseAttnBackend):
         # initialize some data members
         tp_size = get_tp_info().size
         self.qo_head_local = div_even(self.config.num_qo_heads, tp_size)
-        self.kv_head_local = div_even(self.config.num_kv_heads, tp_size)
+        self.kv_head_local = div_even(self.config.num_kv_heads, tp_size, allow_replicate=True)
 
         self.cached_ones_cpu: torch.Tensor = torch.tensor([], dtype=torch.int32, pin_memory=True)
         # for cuda graph
@@ -127,16 +117,19 @@ class FlashInferBackend(BaseAttnBackend):
         self.max_graph_bs = 0
         self.graph_wrappers: Dict[int, CUDAGraphBatchDecodeWithPagedKVCacheWrapper] = {}
         self.capture: FICaptureData | None = None
-        self.page_table = page_table
+        self.last_event = torch.cuda.Event()
+        self.last_event.record()
 
-    @staticmethod
-    def _initialize_metadata_once(metadata: FIMetadata) -> None:
+    def _initialize_metadata_once(self, metadata: FIMetadata) -> None:
         if metadata.initialized:
             return
 
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
         metadata.initialized = True
+        # FlashInfer planning reuses a pinned host staging buffer and launches an
+        # async H2D copy. Wait here before the next plan mutates that host buffer.
+        self.last_event.synchronize()
         if isinstance(metadata.wrapper, BatchDecodeWithPagedKVCacheWrapper):
             metadata.wrapper.plan(
                 indptr=metadata.cu_seqlens_k_cpu,
@@ -170,6 +163,7 @@ class FlashInferBackend(BaseAttnBackend):
                 non_blocking=True,
                 causal=True,
             )
+        self.last_event.record()
 
     def _get_ones_cpu(self, bs: int) -> torch.Tensor:
         if bs <= len(self.cached_ones_cpu):
@@ -182,11 +176,15 @@ class FlashInferBackend(BaseAttnBackend):
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
+        def _flatten_cache(cache: torch.Tensor) -> torch.Tensor:  # treat page = 1
+            return cache.view(-1, 1, cache.shape[2], cache.shape[3])
+
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         self._initialize_metadata_once(metadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
+        kv_cache = (_flatten_cache(kv_cache[0]), _flatten_cache(kv_cache[1]))
         return metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
 
     def prepare_metadata(self, batch: Batch) -> None:
@@ -197,23 +195,24 @@ class FlashInferBackend(BaseAttnBackend):
         seqlens_k = [req.device_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
         max_seqlen_q = max(seqlens_q)
-        cpu_kwargs = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
 
         device = self.device
-        seq_len_cpu = torch.tensor(seqlens_k, **cpu_kwargs)
-        cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **cpu_kwargs).cumsum_(dim=0)
+        seq_len_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
+        cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
         if max_seqlen_q == 1:  # decode with all extend_len = 1
-            cu_seqlens_q_cpu = torch.arange(0, padded_size + 1, **cpu_kwargs)
+            cu_seqlens_q_cpu = torch.arange(0, padded_size + 1, **CPU_KWARGS)
         elif all(l == 0 for l in cached_lens):  # prefill with no cache hit
             cu_seqlens_q_cpu = cu_seqlens_k_cpu
         else:  # normal extend prefill, with partial cache hit
-            cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **cpu_kwargs).cumsum_(dim=0)
+            cu_seqlens_q_cpu = torch.tensor([0] + seqlens_q, **CPU_KWARGS).cumsum_(dim=0)
+
+        page_table = get_global_ctx().page_table
         batch.attn_metadata = FIMetadata(
-            positions=make_positions(device, reqs),
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([self.page_table[req.table_idx, : req.device_len] for req in reqs]),
+            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
             last_page_len_cpu=self._get_ones_cpu(padded_size),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
@@ -247,7 +246,6 @@ class FlashInferBackend(BaseAttnBackend):
 
         bs = batch.size
         assert bs in self.capture_bs and bs not in self.graph_wrappers and self.capture
-        batch.padded_reqs = batch.reqs
         capture = self.capture
         self.graph_wrappers[bs] = CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
             self.float_workspace_buffer,
@@ -263,17 +261,11 @@ class FlashInferBackend(BaseAttnBackend):
         metadata = batch.attn_metadata
         assert isinstance(metadata, FIMetadata)
         metadata.wrapper = self.graph_wrappers[bs]
-        metadata.positions = capture.positions[:bs]
-        batch.input_ids = capture.input_ids[:bs]
-        batch.out_loc = capture.out_loc[:bs]
         self._initialize_metadata_once(metadata)
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
         assert isinstance(metadata, FIMetadata) and not metadata.initialized
         assert self.capture is not None and bs in self.capture_bs
-        self.capture.input_ids[:bs].copy_(batch.input_ids)
-        self.capture.out_loc[:bs].copy_(batch.out_loc)
-        self.capture.positions[:bs].copy_(metadata.positions)
         metadata.wrapper = self.graph_wrappers[bs]
         self._initialize_metadata_once(metadata)

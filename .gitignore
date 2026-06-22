@@ -30,4 +30,5 @@ env/
 
 # .vscode
 .vscode/
+.coverage
 core

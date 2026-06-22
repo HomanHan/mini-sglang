@@ -11,8 +11,6 @@ if TYPE_CHECKING:
 
 @dataclass
 class BaseAttnMetadata(ABC):
-    positions: torch.Tensor
-
     @abstractmethod
     def get_last_indices(self, bs: int) -> torch.Tensor: ...
 

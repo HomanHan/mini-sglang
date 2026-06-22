@@ -5,6 +5,8 @@ from typing import List
 
 import torch
 from minisgl.message import (
+    AbortBackendMsg,
+    AbortMsg,
     BaseBackendMsg,
     BaseFrontendMsg,
     BaseTokenizerMsg,
@@ -16,8 +18,7 @@ from minisgl.message import (
     UserMsg,
     UserReply,
 )
-from minisgl.utils import ZmqPullQueue, ZmqPushQueue, init_logger
-from transformers import AutoTokenizer, LlamaTokenizer
+from minisgl.utils import ZmqPullQueue, ZmqPushQueue, init_logger, load_tokenizer
 
 
 def _unwrap_msg(msg: BaseTokenizerMsg) -> List[BaseTokenizerMsg]:
@@ -36,6 +37,7 @@ def tokenize_worker(
     frontend_addr: str,
     local_bs: int,
     tokenizer_id: int = -1,
+    model_source: str = "huggingface",
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
     # 初始化三个 ZMQ 队列
@@ -46,7 +48,7 @@ def tokenize_worker(
     # recv_listener: 接收所有消息 (来自 API Server 或 Scheduler)
     recv_listener = ZmqPullQueue(addr, create=create, decoder=BatchTokenizerMsg.decoder)
     assert local_bs > 0
-    tokenizer: LlamaTokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=True)
+    tokenizer = load_tokenizer(tokenizer_path)
     logger = init_logger(__name__, f"tokenizer_{tokenizer_id}")
 
     from .detokenize import DetokenizeManager
@@ -72,7 +74,8 @@ def tokenize_worker(
             detokenize_msg = [m for m in pending_msg if isinstance(m, DetokenizeMsg)]
             # TokenizeMsg: 来自 API Server，包含 prompt 文本
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
-            assert len(detokenize_msg) + len(tokenize_msg) == len(pending_msg)
+            abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
+            assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) == len(pending_msg)
 
             # 3. 处理 Detokenize (ID -> Text)
             if len(detokenize_msg) > 0:
@@ -107,6 +110,13 @@ def tokenize_worker(
                         )
                         for msg, t in zip(tokenize_msg, tensors, strict=True)
                     ]
+                )
+                if len(batch_output.data) == 1:
+                    batch_output = batch_output.data[0]
+                send_backend.put(batch_output)
+            if len(abort_msg) > 0:
+                batch_output = BatchBackendMsg(
+                    data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]
                 )
                 if len(batch_output.data) == 1:
                     batch_output = batch_output.data[0]

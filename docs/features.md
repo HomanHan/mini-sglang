@@ -23,17 +23,22 @@ To scale performance across multiple GPUs, Mini-SGLang supports Tensor Paralleli
 Our framework currently supports the following dense model architectures:
 
 - [`Llama-3`](https://huggingface.co/collections/meta-llama/llama-31) series
-- [`Qwen-3`](https://huggingface.co/collections/Qwen/qwen3) series
+- [`Qwen-3`](https://huggingface.co/collections/Qwen/qwen3) series (including MoE)
+- [`Qwen-2.5`](https://huggingface.co/collections/Qwen/qwen25) series
 
 ## Chunked Prefill
 
 Chunked Prefill, a technique introduced by [Sarathi-Serve](https://arxiv.org/abs/2403.02310), is enabled by default. This feature splits long prompts into smaller chunks during the prefill phase, significantly reducing peak memory usage and preventing Out-Of-Memory (OOM) errors in long-context serving. The chunk size can be configured using `--max-prefill-length n`. Note that setting `n` to a very small value (e.g., 128) is not recommended as it may significantly degrade performance.
 
+## Page Size
+
+You can specify the page size of the system using the `--page-size` argument.
+
 ## Attention Backends
 
-Mini-SGLang integrates high-performance attention kernels, including [`FlashAttention`](https://github.com/Dao-AILab/flash-attention) and [`FlashInfer`](https://github.com/flashinfer-ai/flashinfer). It supports using different backends for the prefill and decode phases to maximize efficiency. For example, on NVIDIA Hopper GPUs, `FlashAttention3` is used for prefill and `FlashInfer` for decoding by default.
+Mini-SGLang integrates high-performance attention kernels, including [`FlashAttention`](https://github.com/Dao-AILab/flash-attention) (`fa`), [`FlashInfer`](https://github.com/flashinfer-ai/flashinfer) (`fi`) and [`TensorRT-LLM fmha`](https://github.com/NVIDIA/TensorRT-LLM) (`trtllm`). It supports using different backends for the prefill and decode phases to maximize efficiency. For example, on NVIDIA Hopper GPUs, `FlashAttention 3` is used for prefill and `FlashInfer` for decode by default.
 
-You can specify the backend using the `--attn` argument. If two values are provided (e.g., `--attn fa,fi`), the first specifies the prefill backend and the second the decode backend.
+You can specify the backend using the `--attn` argument. If two values are provided (e.g., `--attn fa,fi`), the first specifies the prefill backend and the second the decode backend. Note that some attention backend might override the user-provided page size (e.g. `trtllm` only supports page size 16,32,64).
 
 ## CUDA Graph
 

@@ -34,7 +34,7 @@ class AttentionLayer(StateLessOP):
         self.head_dim = head_dim
         tp_size = get_tp_info().size
         self.num_qo_heads = div_even(num_qo_heads, tp_size)
-        self.num_kv_heads = div_even(num_kv_heads, tp_size)
+        self.num_kv_heads = div_even(num_kv_heads, tp_size, allow_replicate=True)
         self.qo_attn_dim = self.num_qo_heads * head_dim
         self.kv_attn_dim = self.num_kv_heads * head_dim
         
@@ -54,14 +54,12 @@ class AttentionLayer(StateLessOP):
 
     def forward(self, qkv: torch.Tensor) -> torch.Tensor:
         ctx = get_global_ctx()
-        metadata = ctx.batch.attn_metadata
         q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
         if self.q_norm is not None:
             self.q_norm.forward_inplace(q.view(-1, self.num_qo_heads, self.head_dim))
         if self.k_norm is not None:
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
-        if self.rotary:
-            q, k = self.rotary.forward(metadata.positions, q, k)
+        q, k = self.rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
         return o.view(-1, self.qo_attn_dim)

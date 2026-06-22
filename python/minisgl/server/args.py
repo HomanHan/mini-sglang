@@ -8,7 +8,7 @@ from typing import List, Tuple
 import torch
 from minisgl.distributed import DistributedInfo
 from minisgl.scheduler import SchedulerConfig
-from minisgl.utils import cached_load_hf_config, init_logger
+from minisgl.utils import init_logger
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     Returns:
         EngineConfig instance with parsed arguments
     """
-    from minisgl.attention import SUPPORTED_ATTENTION_BACKENDS, validate_attn_backend
+    from minisgl.attention import validate_attn_backend
     from minisgl.kvcache import SUPPORTED_CACHE_MANAGER
     from minisgl.moe import SUPPORTED_MOE_BACKENDS
 
@@ -69,6 +69,7 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     parser.add_argument(
         "--model-path",
+        "--model",
         type=str,
         required=True,
         help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
@@ -171,7 +172,6 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
 
     parser.add_argument(
         "--num-pages",
-        "--num-tokens",
         dest="num_page_override",
         type=int,
         default=ServerArgs.num_page_override,
@@ -179,13 +179,27 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--page-size",
+        type=int,
+        default=ServerArgs.page_size,
+        help="Set the page size for system management.",
+    )
+
+    parser.add_argument(
         "--attention-backend",
         "--attn",
         type=validate_attn_backend,
         default=ServerArgs.attention_backend,
-        choices=["auto"] + SUPPORTED_ATTENTION_BACKENDS.supported_names(),
         help="The attention backend to use. If two backends are specified,"
         " the first one is used for prefill and the second one for decode.",
+    )
+
+    parser.add_argument(
+        "--model-source",
+        type=str,
+        default="huggingface",
+        choices=["huggingface", "modelscope"],
+        help="The source to download model from. Either 'huggingface' or 'modelscope'.",
     )
 
     parser.add_argument(
@@ -222,20 +236,29 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
 
+    if kwargs["model_source"] == "modelscope":
+        model_path = kwargs["model_path"]
+        if not os.path.isdir(model_path):
+            from modelscope import snapshot_download
+
+            ignore_patterns = []
+            if kwargs["use_dummy_weight"]:
+                ignore_patterns = ["*.bin", "*.safetensors", "*.pt", "*.ckpt"]
+            model_path = snapshot_download(model_path, ignore_patterns=ignore_patterns)
+            kwargs["model_path"] = model_path
+    del kwargs["model_source"]
+
+    if (dtype_str := kwargs["dtype"]) == "auto":
+        from minisgl.utils import cached_load_hf_config
+
+        dtype_str = cached_load_hf_config(kwargs["model_path"]).dtype
+
     DTYPE_MAP = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
     }
-    if (dtype_str := kwargs["dtype"]) != "auto":
-        kwargs["dtype"] = DTYPE_MAP[dtype_str]
-    else:
-        dtype_or_str = cached_load_hf_config(kwargs["model_path"]).dtype
-        if isinstance(dtype_or_str, str):
-            kwargs["dtype"] = DTYPE_MAP[dtype_or_str]
-        else:
-            kwargs["dtype"] = dtype_or_str
-
+    kwargs["dtype"] = DTYPE_MAP[dtype_str] if isinstance(dtype_str, str) else dtype_str
     kwargs["tp_info"] = DistributedInfo(0, kwargs["tensor_parallel_size"])
     del kwargs["tensor_parallel_size"]
 

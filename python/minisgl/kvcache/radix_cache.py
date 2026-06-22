@@ -3,18 +3,23 @@ from __future__ import annotations
 import heapq
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple, TypeAlias
 
 import torch
+from minisgl.core import get_global_ctx
+from minisgl.utils import align_down
 
-from .base import BaseCacheHandle, BaseCacheManager, SizeInfo
+from .base import BaseCacheHandle, BasePrefixCache, InsertResult, MatchResult, SizeInfo
+
+KEY_FN: TypeAlias = Callable[[torch.Tensor], Any]
 
 
 class RadixTreeNode:
     counter: int = 0
 
-    def __init__(self, tic: int | None = None) -> None:
-        self.children: Dict[int, RadixTreeNode] = {}
+    def __init__(self, key_fn: KEY_FN, tic: int | None = None) -> None:
+        self.key_fn = key_fn
+        self.children: Dict[Any, RadixTreeNode] = {}
         self._parent: RadixTreeNode | None = None
         self.ref_count: int = 0
         self.uuid = RadixTreeNode.counter
@@ -34,7 +39,7 @@ class RadixTreeNode:
 
     def set_parent(self, parent: RadixTreeNode) -> None:
         self._parent = parent
-        parent.children[int(self._key[0].item())] = self
+        parent.children[self.key_fn(self._key)] = self
 
     @property
     def length(self) -> int:
@@ -61,13 +66,13 @@ class RadixTreeNode:
         # compare key and input_ids, find the first diff
         return fast_compare_key(self._key, input_ids)   # 调用一个 CUDA kernel 快速比较 _key 和输入序列，找到第一处不同的位置
 
+    def split_at(self, pos: int) -> RadixTreeNode:
     # 新建一个中间节点 new_node，把原节点的前 pos 个 token/indices 挪到 new_node 上
     # 再把原节点带着剩余的后半段挂到 new_node 下面
-    def _split_at(self, pos: int) -> RadixTreeNode:
         assert 0 < pos < self.length
         parent = self.parent
 
-        new_node = RadixTreeNode(self.timestamp)
+        new_node = RadixTreeNode(self.key_fn, self.timestamp)
         new_node.set_key_value(self._key[:pos], self._value[:pos])
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
@@ -85,19 +90,30 @@ class RadixTreeNode:
 class RadixCacheHandle(BaseCacheHandle):
     node: RadixTreeNode
 
+    def get_matched_indices(self) -> torch.Tensor:
+        node = self.node
+        value_list: List[torch.Tensor] = []
+        while not node.is_root():
+            value_list.append(node.value)
+            node = node.parent
+        value_list.reverse()
+        return torch.cat(value_list)
+
 
 # Radix 的匹配不是一 token 一节点的 trie，而是“压缩过的 trie”：
 #   每个节点的 _key 可能是一段 token 序列，因此匹配时需要计算“这一段 key 和输入序列能匹配多长”
 #   如果只匹配了前半段，就必须把节点从中间切开（split）再返回，这样树才能继续保持正确结构
-class RadixCacheManager(BaseCacheManager):
+class RadixPrefixCache(BasePrefixCache):
     def __init__(self, device: torch.device):
-        self.device = device
-        self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         super().__init__()
-        self.root_node = RadixTreeNode()
-        self.root_node.ref_count = 1  # root is always protected
+        self.device = device
+        self.page_size = get_global_ctx().page_size
+        self.key_fn = _get_key_fn(self.page_size)
+        self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         self.evictable_size = 0
         self.protected_size = 0
+        self.root_node = RadixTreeNode(self.key_fn)
+        self.root_node.ref_count = 1  # root is always protected
 
     # Radix 只允许驱逐 ref_count == 0 的节点，因此当某个请求命中了树上的一段前缀，这段前缀以及它的祖先路径必须被“lock”
     # 下面这个函数通过沿父指针一路向上修改 ref_count 来实现 lock/unlock 的功能，同时维护 evictable_size/protected_size
@@ -120,57 +136,21 @@ class RadixCacheManager(BaseCacheManager):
                 node.ref_count += 1
                 node = node.parent
 
-    def match_prefix(self, input_ids: torch.Tensor) -> Tuple[RadixCacheHandle, torch.Tensor]:
-        node, prefix_len = self._walk(input_ids)
-        if prefix_len == 0:
-            assert node.is_root() and node is self.root_node and prefix_len == 0
-            return RadixCacheHandle(prefix_len, node), self.empty_tensor
-        value_list: List[torch.Tensor] = []
-        matched_node = node
-        while not node.is_root():
-            value_list.append(node.value)
-            node = node.parent
-        value_list.reverse()
-        return RadixCacheHandle(prefix_len, matched_node), torch.cat(value_list)
+    def match_prefix(self, input_ids: torch.Tensor) -> MatchResult:
+        node, prefix_len = self._tree_walk(input_ids)
+        return MatchResult(RadixCacheHandle(prefix_len, node))
 
-    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> int:
-        node, prefix_len = self._walk(input_ids)
-        assert prefix_len <= len(input_ids)
-        if prefix_len < len(input_ids):
-            new_node = RadixTreeNode()
+    def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> InsertResult:
+        insert_len = align_down(len(input_ids), self.page_size)
+        input_ids, indices = input_ids[:insert_len], indices[:insert_len]
+        node, prefix_len = self._tree_walk(input_ids)
+        if prefix_len != insert_len:  # NOTE: prefix_len < insert_len
+            new_node = RadixTreeNode(self.key_fn)
             new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:].clone())
             new_node.set_parent(node)
             self.evictable_size += new_node.length
-        return prefix_len
-
-    # 沿着 children 走树，遇到三种情况就停：
-    #   下一 token 没有子节点、节点只部分匹配需要 split、或者完整走完输入序列。
-    def _walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
-        prefix_len = 0
-        indice_len = len(input_ids)
-        node = self.root_node
-        tic = time.monotonic_ns()
-
-        while prefix_len < indice_len:
-            this_id = int(input_ids[prefix_len].item())
-            if this_id not in node.children:
-                return node, prefix_len
-
-            node = node.children[this_id]
-
-            # NOTE: at least 1 char is matched, so match_len >= 1
-            match_len = node.get_match_len(input_ids[prefix_len:])
-            prefix_len += match_len
-
-            # need to split the node if not fully matched
-            if match_len != node.length:
-                node = node._split_at(match_len)
-                return node, prefix_len
-
-            # update timestamp for accessed node
-            node.timestamp = tic
-
-        return node, prefix_len
+            node = new_node
+        return InsertResult(prefix_len, RadixCacheHandle(insert_len, node))
 
     # 两条硬约束：只能驱逐 ref_count == 0 的节点，优先驱逐叶子节点（防止破坏其他前缀路径）
     # 在满足约束的候选集合里，它用 timestamp 做 LRU
@@ -197,12 +177,25 @@ class RadixCacheManager(BaseCacheManager):
             evicted_indices.append(node.value)  # value 存 token 前缀对应的 page ids，驱逐的直接收益就是把这些 page ids 交还给上层重新分配
             self.evictable_size -= node.length
             parent = node.parent
-            del parent.children[int(node._key[0].item())]   # 从父节点的 children 里移除这个叶子，等价于把这段前缀从 cache 里彻底删除
+            del parent.children[self.key_fn(node._key)] # 从父节点的 children 里移除这个叶子，等价于把这段前缀从 cache 里彻底删除
             # NOTE: root is always protected, so won't be evicted
             if parent.is_leaf() and parent.ref_count == 0:  # 删掉叶子后，父节点可能变成新的叶子；如果父节点也没人引用，就把它加入候选集合，允许“向上连锁合并式地清理”
                 heapq.heappush(leave_nodes, parent)
 
         return torch.cat(evicted_indices)
+
+    def reset(self) -> None:
+        raise NotImplementedError("RadixManager.reset is not implemented")
+
+    @property
+    def size_info(self) -> SizeInfo:
+        return SizeInfo(
+            evictable_size=self.evictable_size,
+            protected_size=self.protected_size,
+        )
+
+    def check_integrity(self) -> None:
+        pass
 
     # 做一次 DFS，把所有叶子节点中 ref_count == 0 的收集出来，以备 evict
     def _collect_leave_nodes_for_evict(self) -> List[RadixTreeNode]:
@@ -220,15 +213,36 @@ class RadixCacheManager(BaseCacheManager):
 
         return leave_nodes
 
-    def reset(self) -> None:
-        raise NotImplementedError("RadixManager.reset is not implemented")
+    def _tree_walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
+        prefix_len = 0
+        indice_len = len(input_ids)
+        node = self.root_node
+        tic = time.monotonic_ns()
 
-    @property
-    def size_info(self) -> SizeInfo:
-        return SizeInfo(
-            evictable_size=self.evictable_size,
-            protected_size=self.protected_size,
-        )
+        while prefix_len < indice_len:
+            child_node = node.children.get(self.key_fn(input_ids[prefix_len:]))
+            if child_node is None:
+                return node, prefix_len
+            node = child_node  # walk to child node
 
-    def check_integrity(self) -> None:
-        pass
+            # NOTE: at least 1 page is matched, so match_len >= page_size
+            match_len = node.get_match_len(input_ids[prefix_len:])
+            match_len = align_down(match_len, self.page_size)
+            prefix_len += match_len
+
+            # need to split the node if not fully matched
+            if match_len != node.length:
+                node = node.split_at(match_len)
+                node.timestamp = tic
+                return node, prefix_len
+
+            # update timestamp for accessed node
+            node.timestamp = tic
+
+        return node, prefix_len
+
+
+def _get_key_fn(page_size: int) -> KEY_FN:
+    if page_size == 1:
+        return lambda x: x[0].item()
+    return lambda x: tuple(x[:page_size].tolist())

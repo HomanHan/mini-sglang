@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import Dict, NamedTuple, Tuple
+from typing import Any, Dict, NamedTuple, Tuple
 
 import torch
 from minisgl.attention import create_attention_backend
 from minisgl.core import Batch, Context, Req, set_global_ctx
 from minisgl.distributed import destroy_distributed, enable_pynccl_distributed, set_tp_info
-from minisgl.kvcache import create_kvcache
+from minisgl.kvcache import create_kvcache_pool
 from minisgl.layers import set_rope_device
-from minisgl.models import create_model, load_hf_weight
+from minisgl.models import create_model, load_weight
 from minisgl.moe import create_moe_backend
-from minisgl.utils import div_even, init_logger, torch_dtype
+from minisgl.utils import div_even, init_logger, is_sm90_supported, is_sm100_supported, torch_dtype
 
 from .config import EngineConfig
 from .graph import GraphRunner, get_free_memory, mem_GB
@@ -26,68 +26,66 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
-def create_page_table(shape: Tuple[int, int], device: torch.device) -> torch.Tensor:
-    return torch.zeros(shape, dtype=torch.int32, device=device)
-
-
-def _align_up_32(num: int) -> int:
-    return (num + 31) // 32 * 32
-
-
 class Engine:
     def __init__(self, config: EngineConfig):
-        self.model_config = config.model_config
-        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         assert not torch.cuda.is_initialized()
+        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        _adjust_config(config)
+
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
+        torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
         self.dtype = config.dtype
+        self.ctx = Context(config.page_size)
+        set_global_ctx(self.ctx)
 
         self.tp_cpu_group = self._init_communication(config)
         init_free_memory = self._sync_get_memory()[1]
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
-        # load model and determine number of pages
+        # ======================= Model initialization ========================
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
-        self.num_pages = self.dummy_page = self._determine_num_pages(init_free_memory, config)
-        self.kv_cache = create_kvcache(
+
+        # ======================= KV cache initialization ========================
+        self.num_pages = self._determine_num_pages(init_free_memory, config)
+        num_tokens = self.num_pages * config.page_size
+        self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
             num_pages=self.num_pages + 1,  # +1 for dummy page
+            page_size=config.page_size,
             device=self.device,
             dtype=self.dtype,
         )
-        # NOTE: make page table 128 aligned (32 * sizeof(int32) == 128 bytes)
-        self.max_seq_len = _align_up_32(min(config.max_seq_len, self.num_pages))
-        self.page_table = create_page_table(  # + 1 for dummy request
-            (config.max_running_req + 1, self.max_seq_len),
+
+        # ======================= Page table initialization ========================
+        # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
+        self.max_seq_len = min(config.max_seq_len, num_tokens)
+        aligned_max_seq_len = _align_up_32(self.max_seq_len)
+        self.ctx.page_table = self.page_table = torch.zeros(  # + 1 for dummy request
+            (config.max_running_req + 1, aligned_max_seq_len),
+            dtype=torch.int32,
             device=self.device,
         )
-        self.attn_backend = create_attention_backend(
-            config.attention_backend,
-            config.model_config,
-            self.kv_cache,
-            self.page_table,
+
+        # ======================= Attention & MoE backend initialization ========================
+        self.ctx.attn_backend = self.attn_backend = create_attention_backend(
+            config.attention_backend, config.model_config
         )
-        self.moe_backend = (
-            create_moe_backend(config.moe_backend)
-            if "moe" in config.model_config.model_type
-            else None
-        )
-        self.ctx = Context(page_size=1, attn_backend=self.attn_backend)
-        if self.moe_backend:
-            self.ctx.moe_backend = self.moe_backend
-        set_global_ctx(self.ctx)
-        self.sampler = Sampler(self.device, self.model_config.vocab_size)
+        if config.model_config.is_moe:
+            self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+
+        # ======================= Sampler initialization ========================
+        self.sampler = Sampler(self.device, config.model_config.vocab_size)
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
 
-        # cuda graph related
+        # ======================= Graph capture initialization ========================
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
             table_idx=config.max_running_req,
@@ -97,7 +95,7 @@ class Engine:
             sampling_params=None,  # type: ignore
             cache_handle=None,  # type: ignore
         )
-        self.page_table[self.dummy_req.table_idx].fill_(self.dummy_page)
+        self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
@@ -106,8 +104,8 @@ class Engine:
             cuda_graph_bs=config.cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
-            max_seq_len=self.max_seq_len,
-            vocab_size=self.model_config.vocab_size,
+            max_seq_len=aligned_max_seq_len,
+            vocab_size=config.model_config.vocab_size,
             dummy_req=self.dummy_req,
         )
 
@@ -145,20 +143,17 @@ class Engine:
                 for k, v in self.model.state_dict().items()
             }
         else:
-            return {
-                k: v.to(self.dtype)
-                for k, v in load_hf_weight(config.model_path, self.device).items()
-            }
+            return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
             2  # key + value
-            * self.model_config.head_dim
-            * div_even(self.model_config.num_kv_heads, config.tp_info.size)
+            * config.model_config.head_dim
+            * div_even(config.model_config.num_kv_heads, config.tp_info.size, allow_replicate=True)
             * config.page_size
             * self.dtype.itemsize
-            * self.model_config.num_layers
+            * config.model_config.num_layers
         )
         num_pages = config.num_page_override
         if num_pages is None:
@@ -166,9 +161,10 @@ class Engine:
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory
             num_pages = available_memory // cache_per_page
 
-        assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-tokens"
+        assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
+        num_tokens = num_pages * config.page_size
         real_kv_size = num_pages * cache_per_page
-        logger.info(f"Allocating {num_pages} pages for KV cache, K + V = {mem_GB(real_kv_size)}")
+        logger.info(f"Allocating {num_tokens} tokens for KV cache, K + V = {mem_GB(real_kv_size)}")
         return num_pages
 
     def _sync_get_memory(self) -> Tuple[int, int]:
@@ -213,3 +209,25 @@ class Engine:
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
+
+
+def _align_up_32(num: int) -> int:
+    return (num + 31) // 32 * 32
+
+
+def _adjust_config(config: EngineConfig):
+    def override(attr: str, value: Any):  # this is dangerous, use with caution
+        object.__setattr__(config, attr, value)
+
+    if config.attention_backend == "auto":
+        backend = "trtllm" if is_sm100_supported() else ("fa,fi" if is_sm90_supported() else "fi")
+        override("attention_backend", backend)
+        logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
+
+    if "trtllm" in config.attention_backend and config.page_size not in [16, 32, 64]:
+        override("page_size", 64)
+        logger.warning_rank0("Page size is overridden to 64 for TRTLLM backend")
+
+    if config.model_config.is_moe and config.moe_backend == "auto":
+        override("moe_backend", "fused")
+        logger.info_rank0(f"Auto-selected MoE backend: {config.moe_backend}")

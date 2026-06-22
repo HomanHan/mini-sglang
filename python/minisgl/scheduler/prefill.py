@@ -22,10 +22,11 @@ logger = init_logger(__name__)
 
 class ChunkedReq(Req):
     def append_host(self, next_token: torch.Tensor) -> None:
-        raise NotImplementedError("ChunkedReq should be sampled")
+        raise NotImplementedError("ChunkedReq should not be sampled")
 
+    @property
     def can_decode(self) -> bool:
-        return False
+        return False  # avoid being added to decode manager
 
 # PrefillAdder 先把 token 内容准备好？？？
 # Scheduler 统一分配 KV 页并回填 page_table
@@ -41,7 +42,8 @@ class PrefillAdder:
         if self.table_manager.available_size == 0:
             return None
 
-        handle, match_indices = self.cache_manager.match_req(req)   # 命中了多长的前缀（handle.cached_len），以及命中前缀对应的 KV pages 在哪里（match_indices）
+        # TODO: consider host cache match case
+        handle = self.cache_manager.match_req(req).cuda_handle
         cached_len = handle.cached_len
         # TODO: better estimate policy
         # 在把请求塞进 batch 之前，先估算“这轮算上它之后，KV pages 够不够”，不够就先不收这个请求
@@ -59,8 +61,8 @@ class PrefillAdder:
         if cached_len > 0:  # NOTE: set the cached part
             device_ids = self.table_manager.token_pool[table_idx][:cached_len]
             page_entry = self.table_manager.page_table[table_idx][:cached_len]
-            device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True) # 将 token ids 从 CPU 拷贝到 GPU 的 token_pool 中
-            page_entry.copy_(match_indices) # 在 page_table 中写入匹配前缀的 Page Index
+            device_ids.copy_(req.input_ids[:cached_len].pin_memory(), non_blocking=True)
+            page_entry.copy_(handle.get_matched_indices())
 
         return handle, table_idx
 
@@ -81,8 +83,8 @@ class PrefillAdder:
         self.reserved_size += remain_len + pending_req.output_len
         # NOTE: update the tokens ids only; new pages will be allocated in the scheduler
         _slice = slice(cached_len, cached_len + chunk_size)
-        device_ids = self.table_manager.token_pool[table_idx][_slice] # 拿到 token_pool 里这个 slot 对应的目标写入区间
-        device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True) # 把 token ids 从 CPU 的 input_ids 拷贝入 GPU 的 token_pool
+        device_ids = self.table_manager.token_pool[table_idx, _slice]
+        device_ids.copy_(pending_req.input_ids[_slice].pin_memory(), non_blocking=True)
         return CLS(
             input_ids=pending_req.input_ids[: cached_len + chunk_size],
             table_idx=table_idx,
@@ -156,6 +158,13 @@ class PrefillManager:
             return None
         self.pending_list = chunked_list + self.pending_list[len(reqs) :]
         return Batch(reqs=reqs, phase="prefill")
+
+    def abort_req(self, uid: int) -> Req | None:
+        for i, req in enumerate(self.pending_list):
+            if req.uid == uid:
+                self.pending_list.pop(i)
+                return req.chunked_req
+        return None
 
     @property
     def runnable(self) -> bool:

@@ -1,16 +1,14 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List
+from typing import List
 
 import torch
 from minisgl.message import TokenizeMsg
-
-if TYPE_CHECKING:
-    from transformers import LlamaTokenizer
+from transformers import PreTrainedTokenizerBase
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: LlamaTokenizer) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         self.tokenizer = tokenizer
 
     def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:

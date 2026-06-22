@@ -1,12 +1,8 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List
-
-if TYPE_CHECKING:
-    from transformers import LlamaTokenizer
+from typing import Dict, List
 
 from minisgl.message import DetokenizeMsg
+from transformers import PreTrainedTokenizerBase
 
 # Borrowed from sglang
 
@@ -67,7 +63,7 @@ class DecodeStatus:
 # Detokenizer 不能简单地把 ID 转为字符，因为存在 Unicode 分词问题
 # （比如一个汉字可能由 3 个 Token 组成，只收到前 2 个时是乱码）
 class DetokenizeManager:
-    def __init__(self, tokenizer: LlamaTokenizer) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
         # uid -> DecodeStatus
         self.decode_map: Dict[int, DecodeStatus] = (
             {}

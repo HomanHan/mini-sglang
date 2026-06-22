@@ -23,24 +23,7 @@ def create_fused_moe_backend():
     return FusedMoe()
 
 
-def resolve_auto_backend() -> str:
-    return "fused"
-
-
-def validate_moe_backend(backend: str) -> bool:
-    if backend != "auto":
-        SUPPORTED_MOE_BACKENDS.assert_supported(backend)
-    return True
-
-
 def create_moe_backend(backend: str) -> BaseMoeBackend:
-    if backend == "auto":
-        backend = resolve_auto_backend()
-        logger.info(f"Auto-selected MoE backend: {backend}")
-    else:
-        validate_moe_backend(backend)
-        logger.info(f"Selected MoE backend: {backend}")
-
     return SUPPORTED_MOE_BACKENDS[backend]()
 
 
@@ -48,5 +31,4 @@ __all__ = [
     "BaseMoeBackend",
     "create_moe_backend",
     "SUPPORTED_MOE_BACKENDS",
-    "validate_moe_backend",
 ]

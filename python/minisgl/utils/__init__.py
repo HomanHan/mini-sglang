@@ -1,7 +1,7 @@
 from .arch import is_arch_supported, is_sm90_supported, is_sm100_supported
-from .hf import cached_load_hf_config, get_rope_config
+from .hf import cached_load_hf_config, download_hf_weight, load_tokenizer, get_rope_config
 from .logger import init_logger
-from .misc import UNSET, Unset, call_if_main, div_ceil, div_even
+from .misc import UNSET, Unset, align_ceil, align_down, call_if_main, div_ceil, div_even
 from .mp import (
     ZmqAsyncPullQueue,
     ZmqAsyncPushQueue,
@@ -15,6 +15,8 @@ from .torch_utils import nvtx_annotate, torch_dtype
 
 __all__ = [
     "cached_load_hf_config",
+    "download_hf_weight",
+    "load_tokenizer",
     "get_rope_config",
     "init_logger",
     "is_arch_supported",
@@ -23,6 +25,8 @@ __all__ = [
     "call_if_main",
     "div_even",
     "div_ceil",
+    "align_ceil",
+    "align_down",
     "UNSET",
     "Unset",
     "torch_dtype",

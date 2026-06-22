@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 from minisgl.core import get_global_ctx
 from minisgl.distributed import DistributedCommunicator, get_tp_info
@@ -15,21 +13,16 @@ class MoELayer(BaseOP):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        layer_id: Optional[int] = None,
-        params_dtype: Optional[torch.dtype] = None,
         renormalize: bool = True,
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
     ):
         super().__init__()
-        if params_dtype is None:
-            params_dtype = torch.get_default_dtype()
 
         self.num_experts = num_experts
         self.top_k = top_k
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
-        self.params_dtype = params_dtype
         self._comm = DistributedCommunicator()
 
         tp_info = get_tp_info()
@@ -37,19 +30,16 @@ class MoELayer(BaseOP):
         self.renormalize = renormalize
         self.activation = activation
         self.apply_router_weight_on_input = apply_router_weight_on_input
-        self.layer_id = layer_id
         intermediate_size_per_partition = div_even(intermediate_size, tp_size)
         self.gate_up_proj = torch.empty(
             num_experts,
             2 * intermediate_size_per_partition,
             hidden_size,
-            dtype=params_dtype,
         )
         self.down_proj = torch.empty(
             num_experts,
             hidden_size,
             intermediate_size_per_partition,
-            dtype=params_dtype,
         )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):

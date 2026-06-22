@@ -4,8 +4,11 @@ from .config import ModelConfig
 
 _MODEL_REGISTRY = {
     "LlamaForCausalLM": (".llama", "LlamaForCausalLM"),
+    "Qwen2ForCausalLM": (".qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": (".qwen3", "Qwen3ForCausalLM"),
     "Qwen3MoeForCausalLM": (".qwen3_moe", "Qwen3MoeForCausalLM"),
+    "MistralForCausalLM": (".mistral", "MistralForCausalLM"),
+    "Mistral3ForConditionalGeneration": (".mistral", "MistralForCausalLM"),
     "Qwen3_5ForCausalLM": (".qwen3_5", "Qwen3_5ForCausalLM"),
 }
 

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, List
 
 import torch
 from minisgl.core import Batch, get_global_ctx
-from minisgl.utils import is_sm100_supported
 
 from .base import BaseAttnBackend, BaseAttnMetadata
 from .utils import BaseCaptureData
@@ -15,12 +14,12 @@ if TYPE_CHECKING:
 
 
 @dataclass
-class FACaptureData(BaseCaptureData):
+class TRTLLMCaptureData(BaseCaptureData):
     pass
 
 
 @dataclass
-class FAMetadata(BaseAttnMetadata):
+class TRTLLMMetadata(BaseAttnMetadata):
     cu_seqlens_k: torch.Tensor
     cu_seqlens_q: torch.Tensor
     cache_seqlens: torch.Tensor
@@ -33,36 +32,61 @@ class FAMetadata(BaseAttnMetadata):
         return self.cu_seqlens_q[1 : 1 + bs] - 1
 
 
-class FlashAttentionBackend(BaseAttnBackend):
+class TensorRTLLMBackend(BaseAttnBackend):
     def __init__(self, config: ModelConfig):
         ctx = get_global_ctx()
         self.config = config
         self.kvcache = ctx.kv_cache
         self.page_size = ctx.page_size
-        self.capture: FACaptureData | None = None
+        self.capture: TRTLLMCaptureData | None = None
         self.max_graph_bs = 0
         self.capture_bs: List[int] = []
         self.scale = config.head_dim**-0.5
-        self.version = 4 if is_sm100_supported() else 3
+        self.workspace_buffer = torch.empty(
+            128 * 1024 * 1024, dtype=torch.uint8, device=self.kvcache.device
+        )
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, layer_id: int, batch: Batch
     ) -> torch.Tensor:
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+        from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+
         metadata = batch.attn_metadata
-        assert isinstance(metadata, FAMetadata)
+        assert isinstance(metadata, TRTLLMMetadata)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
-        return _fa_sgl_impl(
-            q=q,
-            k_cache=self.kvcache.k_cache(layer_id),
-            v_cache=self.kvcache.v_cache(layer_id),
-            page_table=metadata.page_table,
-            cache_seqlens=metadata.cache_seqlens,
-            cu_seqlens_q=metadata.cu_seqlens_q,
-            cu_seqlens_k=metadata.cu_seqlens_k,
-            max_seqlen_q=metadata.max_seqlen_q,
-            softmax_scale=self.scale,
-            version=self.version,
-        )
+        kv_cache = (self.kvcache.k_cache(layer_id), self.kvcache.v_cache(layer_id))
+
+        if batch.is_prefill:
+            return trtllm_batch_context_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=metadata.page_table,
+                seq_lens=metadata.cache_seqlens,
+                max_q_len=metadata.max_seqlen_q,
+                max_kv_len=metadata.max_seqlen_k,
+                bmm1_scale=self.scale,
+                bmm2_scale=1.0,
+                cum_seq_lens_q=metadata.cu_seqlens_q,
+                cum_seq_lens_kv=metadata.cu_seqlens_k,
+                kv_layout="NHD",
+                batch_size=batch.size,
+                out_dtype=q.dtype,
+            )
+        else:
+            return trtllm_batch_decode_with_kv_cache(
+                query=q,
+                kv_cache=kv_cache,
+                workspace_buffer=self.workspace_buffer,
+                block_tables=metadata.page_table,
+                seq_lens=metadata.cache_seqlens,
+                max_seq_len=metadata.max_seqlen_k,
+                bmm1_scale=self.scale,
+                bmm2_scale=1.0,
+                kv_layout="NHD",
+                out_dtype=q.dtype,
+            )
 
     def prepare_metadata(self, batch: Batch) -> None:
         reqs = batch.padded_reqs
@@ -95,7 +119,7 @@ class FlashAttentionBackend(BaseAttnBackend):
         )
         if self.page_size > 1:
             new_page_table.div_(self.page_size, rounding_mode="floor")
-        batch.attn_metadata = FAMetadata(
+        batch.attn_metadata = TRTLLMMetadata(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_q=cu_seqlens_q,
             cache_seqlens=cache_seqlens,
@@ -107,7 +131,9 @@ class FlashAttentionBackend(BaseAttnBackend):
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         assert self.capture is None, "Capture already initialized."
         max_bs = max(bs_list)
-        capture = FACaptureData.create(max_bs, max_seq_len // self.page_size, self.kvcache.device)
+        capture = TRTLLMCaptureData.create(
+            max_bs, max_seq_len // self.page_size, self.kvcache.device
+        )
         self.max_graph_bs = max_bs
         self.capture = capture
         self.capture_bs = sorted(bs_list)
@@ -115,7 +141,7 @@ class FlashAttentionBackend(BaseAttnBackend):
     def prepare_for_capture(self, batch: Batch) -> None:
         assert (bs := batch.size) in self.capture_bs and self.capture
         capture = self.capture
-        metadata = FAMetadata(
+        metadata = TRTLLMMetadata(
             cu_seqlens_k=capture.cu_seqlens_k[: bs + 1],
             cu_seqlens_q=capture.cu_seqlens_q[: bs + 1],
             cache_seqlens=capture.seq_lens[:bs],
@@ -127,56 +153,10 @@ class FlashAttentionBackend(BaseAttnBackend):
 
     def prepare_for_replay(self, batch: Batch) -> None:
         metadata, bs = batch.attn_metadata, batch.padded_size
-        assert isinstance(metadata, FAMetadata)
+        assert isinstance(metadata, TRTLLMMetadata)
         assert self.capture is not None and bs in self.capture_bs
         # cu_seqlens_q is always [0, 1, 2, ..., bs] for decode (i.e. no-op)
         table_len = metadata.page_table.size(1)
         self.capture.cu_seqlens_k[: bs + 1].copy_(metadata.cu_seqlens_k)
         self.capture.seq_lens[:bs].copy_(metadata.cache_seqlens)
         self.capture.page_table[:bs, :table_len].copy_(metadata.page_table)
-
-
-def _fa_sgl_impl(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    page_table: torch.Tensor,
-    cache_seqlens: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
-    max_seqlen_q: int,
-    softmax_scale: float,
-    version: int,
-    sm_margin: int = 0,
-    window_size: Tuple[int, int] = (-1, -1),  # -1 means infinite context window
-    softcap: float = 0.0,  # 0.0 means deactivated
-    num_splits: int = 0,  # Can be tuned for speed
-    pack_gqa: bool | None = None,  # Can be tuned for speed
-    causal: bool = True,
-) -> torch.Tensor:
-    try:
-        from sgl_kernel.flash_attn import flash_attn_with_kvcache
-    except ImportError as e:
-        raise ImportError(
-            "sgl_kernel.flash_attn is not found. Please install it with `pip install sgl-kernel`.\n"
-            "If you're sure it's correctly installed, try `apt update && apt install libnuma1`."
-        ) from e
-
-    return flash_attn_with_kvcache(  # type: ignore
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k_new=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        softmax_scale=softmax_scale,
-        sm_margin=sm_margin,
-        window_size=window_size,
-        softcap=softcap,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        causal=causal,
-        ver=version,  # TODO: support FA4 on blackwell
-    )
