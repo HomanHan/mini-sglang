@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import pathlib
 from typing import TYPE_CHECKING, Any, Literal
 
 from minisgl.env import ENV
@@ -27,7 +28,15 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    try:
+        from nvidia import nccl
+    except ImportError:
+        ldflags = ["-lnccl"]
+    else:
+        lib_dir = pathlib.Path(nccl.__path__[0]) / "lib"
+        ldflags = [str(lib_dir / "libnccl.so.2"), f"-Wl,-rpath,{lib_dir}"]
+
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=ldflags)
 
 
 @functools.cache
