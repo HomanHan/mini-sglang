@@ -32,3 +32,5 @@ env/
 .vscode/
 .coverage
 core
+
+output/
