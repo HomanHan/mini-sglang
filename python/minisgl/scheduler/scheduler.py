@@ -41,6 +41,7 @@ class ForwardInput(NamedTuple):
 
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
+
 # Scheduler 的核心职责只是调度和执行请求，主要包括以下几个方面：
 #   本轮推理执行 Prefill（前缀填充）还是 Decode（增量解码）
 #   为当前批次请求分配多少 KV pages
@@ -61,7 +62,7 @@ class Scheduler(SchedulerIOMixin):
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         self.cache_manager = CacheManager(
             self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
-        )    # KV 页的分配、复用与驱逐
+        )  # KV 页的分配、复用与驱逐
         # 将请求打包成 Batch
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -96,12 +97,16 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
         )
-        for msg in self.receive_msg(blocking=blocking): # 通过 receive_msg 接收新请求，这是持续批处理 Continuous batching 的基础
+        for msg in self.receive_msg(
+            blocking=blocking
+        ):  # 通过 receive_msg 接收新请求，这是持续批处理 Continuous batching 的基础
             self._process_one_msg(msg)
 
-        forward_input = self._schedule_next_batch() # _schedule_next_batch 组装下一轮执行的 batch
+        forward_input = self._schedule_next_batch()  # _schedule_next_batch 组装下一轮执行的 batch
         ongoing_data = None
-        if forward_input is not None:   # batch 就绪，就在 Engine Stream 提交 _forward 任务，GPU 开始执行本轮计算
+        if (
+            forward_input is not None
+        ):  # batch 就绪，就在 Engine Stream 提交 _forward 任务，GPU 开始执行本轮计算
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
                 ongoing_data = (forward_input, self._forward(forward_input))
@@ -205,20 +210,21 @@ class Scheduler(SchedulerIOMixin):
         self.table_manager.free(req.table_idx)
         self.cache_manager.cache_req(req, finished=True)
 
-    def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        self.engine.graph_runner.pad_batch(batch)
-        self.cache_manager.allocate_paged(batch.reqs)
-        batch.positions = _make_positions(batch, self.device)
-        input_mapping = _make_input_tuple(batch, self.device)
-        write_mapping = _make_write_tuple(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_mapping]
-        self.engine.attn_backend.prepare_metadata(batch)
-        return ForwardInput(
-            batch=batch,
-            sample_args=self.engine.sampler.prepare(batch),
-            input_tuple=input_mapping,
-            write_tuple=write_mapping,
-        )
+    # ???
+    # def _prepare_batch(self, batch: Batch) -> ForwardInput:
+    #     self.engine.graph_runner.pad_batch(batch)
+    #     self.cache_manager.allocate_paged(batch.reqs)
+    #     batch.positions = _make_positions(batch, self.device)
+    #     input_mapping = _make_input_tuple(batch, self.device)
+    #     write_mapping = _make_write_tuple(batch, self.device)
+    #     batch.out_loc = self.engine.page_table[input_mapping]
+    #     self.engine.attn_backend.prepare_metadata(batch)
+    #     return ForwardInput(
+    #         batch=batch,
+    #         sample_args=self.engine.sampler.prepare(batch),
+    #         input_tuple=input_mapping,
+    #         write_tuple=write_mapping,
+    #     )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
