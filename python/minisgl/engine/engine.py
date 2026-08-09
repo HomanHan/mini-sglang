@@ -52,7 +52,7 @@ class Engine:
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
         # ======================= KV cache initialization ========================
-        self.num_pages = self._determine_num_pages(init_free_memory, config)
+        self.num_pages = self._determine_num_pages(init_free_memory, config) # 算出能分配多少 kvcache 物理页
         num_tokens = self.num_pages * config.page_size
         self.ctx.kv_cache = self.kv_cache = create_kvcache_pool(
             model_config=config.model_config,
@@ -88,21 +88,21 @@ class Engine:
         # ======================= Graph capture initialization ========================
         self.dummy_req = Req(
             input_ids=torch.tensor([0], dtype=torch.int32, device="cpu"),
-            table_idx=config.max_running_req,
+            table_idx=config.max_running_req, # 将 dummy request 放在 page table 的最后一行
             cached_len=0,
             output_len=1,
-            uid=-1,
+            uid=-1, # 标记为 -1 无效
             sampling_params=None,  # type: ignore
             cache_handle=None,  # type: ignore
         )
-        self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+        self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # 整一行 page_table 都 point to dummy page（都指向最后一个/第 num_tokens 个位置）
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            cuda_graph_bs=config.cuda_graph_bs, # 显式指定要 capture 的 batch sizes
+            cuda_graph_max_bs=config.cuda_graph_max_bs, # 自动生成 batch size 列表时的最大值
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,
@@ -145,8 +145,11 @@ class Engine:
         else:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
+    # 返回可用 kvcache 物理页数量
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
-        new_free_memory = self._sync_get_memory()[1]
+        new_free_memory = self._sync_get_memory()[1]  # 模型加载后的空闲显存
+
+        # 每页 kvcache 需要多少显存
         cache_per_page = (
             2  # key + value
             * config.model_config.head_dim
@@ -158,7 +161,10 @@ class Engine:
         num_pages = config.num_page_override
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
-            available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            available_memory = (
+                int(config.memory_ratio * old_free_memory) - model_memory
+            )  # 总显存预算 - 模型占用显存 = kvcache 可用显存预算
+            # memory_ratio = 0.9, 也就是不管怎么样都要留 10% 的显存给系统和其他程序使用
             num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"

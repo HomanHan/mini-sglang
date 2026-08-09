@@ -117,6 +117,7 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory before capturing CUDA graphs: {mem_GB(free_memory)}")
 
+        # 分配固定的输入输出 buffer
         self.buffer = GraphCaptureBuffer.init(self.max_graph_bs, vocab_size, self.device)
 
         pbar = tqdm(
@@ -131,31 +132,31 @@ class GraphRunner:
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
             graph = torch.cuda.CUDAGraph()
-            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
+            batch = Batch(reqs=[self.dummy_req] * bs, phase="decode") # 一个 dummy_req 复制 bs 份组成一个 batch
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
-            self.buffer.set_batch(batch)
+            self.buffer.set_batch(batch) # 将 Batch 字段绑定到固定 buffer
             with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                self.buffer.logits[:bs] = model.forward() # warmup
+                with torch.cuda.graph(graph, pool=pool, stream=self.stream): # capture graph，记录整个模型的 forward（attention/MLP...）
                     self.buffer.logits[:bs] = model.forward()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
-            self.graph_map[bs] = graph
+            self.graph_map[bs] = graph # 保存 graph
 
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
-        return batch.is_decode and batch.size <= self.max_graph_bs
+        return batch.is_decode and batch.size <= self.max_graph_bs # only decode can use cuda graph replay
 
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
-        self.buffer.copy_from(batch)
+        self.buffer.copy_from(batch) # 更新固定输入 buffer，把当前请求的 batch 数据复制到 buffer 中
         g = self.graph_map[batch.padded_size]
-        self.attn_backend.prepare_for_replay(batch)
+        self.attn_backend.prepare_for_replay(batch) # 把 page table/seq_lens 等复制到 capture 时预分配的 metadata buffer
         g.replay()
-        return self.buffer.logits[: batch.size]
+        return self.buffer.logits[: batch.size] # 丢弃 dummy
 
     def pad_batch(self, batch: Batch) -> None:
         padded_size = (  # choose the first available batch size
