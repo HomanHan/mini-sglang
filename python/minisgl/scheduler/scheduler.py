@@ -211,20 +211,20 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     # ???
-    # def _prepare_batch(self, batch: Batch) -> ForwardInput:
-    #     self.engine.graph_runner.pad_batch(batch)
-    #     self.cache_manager.allocate_paged(batch.reqs)
-    #     batch.positions = _make_positions(batch, self.device)
-    #     input_mapping = _make_input_tuple(batch, self.device)
-    #     write_mapping = _make_write_tuple(batch, self.device)
-    #     batch.out_loc = self.engine.page_table[input_mapping]
-    #     self.engine.attn_backend.prepare_metadata(batch)
-    #     return ForwardInput(
-    #         batch=batch,
-    #         sample_args=self.engine.sampler.prepare(batch),
-    #         input_tuple=input_mapping,
-    #         write_tuple=write_mapping,
-    #     )
+    def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        self.engine.graph_runner.pad_batch(batch)
+        self.cache_manager.allocate_paged(batch.reqs)
+        batch.positions = _make_positions(batch, self.device)
+        input_mapping = _make_input_tuple(batch, self.device)
+        write_mapping = _make_write_tuple(batch, self.device)
+        batch.out_loc = self.engine.page_table[input_mapping]
+        self.engine.attn_backend.prepare_metadata(batch)
+        return ForwardInput(
+            batch=batch,
+            sample_args=self.engine.sampler.prepare(batch),
+            input_tuple=input_mapping,
+            write_tuple=write_mapping,
+        )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
