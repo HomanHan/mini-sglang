@@ -1,676 +1,764 @@
-# 投机解码：算法、模型与推理系统
+# 投机解码研究报告：从精确采样到 DFlash 2
 
-> 状态截至 2026-08-13。本文所称“无损”均指：在给定 target model、采样变换和硬件数值精度下，输出分布与直接从 target 采样一致。它不表示浮点结果逐 bit 相同。
+> 状态截至 2026-08-19。DFlash 2 当前公开材料是技术博客、模型权重与运行时代码，没有独立论文或 arXiv。本文将论文结论、作者实验和代码事实分开表述。“分布无损”指给定 target、采样变换和数值精度下分布一致，不表示浮点结果逐 bit 相同。
 
-## 1. 问题与结论
+## 1. 核心结论
 
-自回归模型一次 forward 通常只生成一个 token。低 batch decode 需要反复从 HBM 读取整套模型权重，常受显存带宽而非算力限制，GPU 的并行计算能力没有充分使用。
+投机解码用廉价草拟模型（drafter）提出多个未来 token，再由目标模型（target）一次并行验证。它减少串行 target 解码步数，通常不减少总 FLOPs。
 
-投机解码将一次生成拆成两步：
+端到端收益由三个相互独立的因素决定：
 
-1. 较便宜的 **drafter** 提出多个未来 token。
-2. **target model** 用一次多-token forward 并行验证候选，只提交满足 target 分布的最长前缀。
+1. **候选质量**：target token 是否进入候选集合。
+2. **候选组织**：能否从候选集合选出条件一致的序列。
+3. **系统效率**：draft、验证、采样、KV Cache 和调度开销是否低于节省的串行 target 计算。
 
-它减少的是串行 target forward 次数，不一定减少 FLOPs。加速成立需要同时满足：
+这解释了该方向的演进：
 
-- drafter 足够快；
-- draft 与 target 足够一致；
-- target 验证多个 token 明显快于逐 token 执行多次 decode；
-- draft、采样、KV Cache 和调度开销没有抵消收益。
+- EAGLE 改善 drafter 与 target 的特征对齐；
+- MTP 将多 token 预测内生到 target 训练；
+- DFlash 将草拟从自回归改为整块并行；
+- DSpark 用轻量顺序校正和置信度调度控制后缀质量与验证浪费；
+- DFlash 2 在保持重计算并行的前提下，用局部卷积提高候选覆盖，用路径选择器提高离散序列一致性。
 
-因此投机解码不是“免费加速”。它通常最适合低到中并发、target 较大、decode 受带宽限制、输出较可预测的场景。高并发时 target 已接近 compute-bound，额外验证 token 可能降低吞吐。
+DFlash 2 的关键认识不是“再做一次 diffusion”，而是：
 
-## 2. 标准算法
+> DFlash 的正确 token 经常已经位于每个位置的 top-k 集合中。问题主要是如何选择一条一致路径，以及如何防止候选集合在块尾退化。
 
-设 target 分布为 $p$，draft 分布为 $q$，draft 长度为 $\gamma$。给定已确认前缀 $x_{<t}$：
+## 2. 精确投机采样
+
+### 2.1 线性验证
+
+设 target 分布为 $p$，drafter 分布为 $q$，候选长度为 $\gamma$。给定已确认前缀，drafter 依次提出
+$y_1,\ldots,y_\gamma$。
+
+常见运行时还保留一个尚未写入 target KV 的末 token $a$，称为 anchor。target 验证输入为：
 
 ```text
-draft:
-  y_1 ~ q(. | x_<t)
-  y_2 ~ q(. | x_<t, y_1)
-  ...
-  y_gamma ~ q(. | x_<t, y_<gamma)
-
-verify:
-  target 一次 forward 得到 p_1, ..., p_gamma, p_bonus
-  从左到右接受候选，遇到第一次拒绝即停止
+[a, y_1, y_2, ..., y_gamma]
 ```
 
-### 2.1 Greedy 验证
+logits 的对齐关系是：
+
+```text
+row(a)       -> 验证 y_1
+row(y_i)     -> 验证 y_(i+1)
+row(y_gamma) -> 产生 bonus token
+```
+
+因此验证 $\gamma$ 个候选通常要计算 $\gamma+1$ 个 query token。候选并非不需要计算，而是把多次串行 decode 合并为一次并行前向计算。
+
+### 2.2 Greedy 验证
 
 对每个位置比较：
 
 $$
-y_i \stackrel{?}{=} \arg\max_x p_i(x)
+y_i \stackrel{?}{=} \arg\max_x p_i(x).
 $$
 
-相等则继续；第一次不等时丢弃该位置及其后缀，提交 target 的 argmax。若全部相等，再提交 target forward 已计算出的 bonus token。结果与 target greedy decoding 相同。
+从左到右提交最长相等前缀。首次不等时提交 target argmax；若全部相等，再提交最后一行 logits 的 bonus token。结果与 target greedy decoding 一致。
 
-### 2.2 随机采样
+### 2.3 随机采样
 
-候选 $y_i\sim q_i$ 的接受概率为：
-
-$$
-a_i(y_i)=\min\left(1,\frac{p_i(y_i)}{q_i(y_i)}\right)
-$$
-
-若 $u_i\sim U(0,1)$ 且 $u_i\le a_i(y_i)$，接受 $y_i$。第一次拒绝发生在位置 $i$ 时，从残差分布采样修正 token：
+若 $y_i\sim q_i$，其接受概率为：
 
 $$
-p'_i(x)=\operatorname{norm}\left(\max(p_i(x)-q_i(x),0)\right)
+A_i(y_i)=\min\left(1,\frac{p_i(y_i)}{q_i(y_i)}\right).
 $$
 
-随后丢弃所有 draft 后缀。若 $\gamma$ 个候选全部接受，则再从 $p_{\gamma+1}$ 采样一个 bonus token。这个修正拒绝采样使每一步条件分布以及完整序列联合分布与直接从 target 采样一致。[Leviathan et al., 2023](https://proceedings.mlr.press/v202/leviathan23a.html) 与 [Chen et al., 2023](https://arxiv.org/abs/2302.01318) 独立给出了现代投机采样方法。
-
-实现时必须保存每个候选位置的 $q_i$，并对 temperature、top-k、top-p 等变换后的 $p_i,q_i$ 执行接受规则。只比较采样出的 token 是否相等，不能保证随机采样无损。
-
-### 2.3 为什么只能接受前缀
-
-$p_i$ 和 $q_i$ 都以此前候选已被接受为条件。位置 $i$ 拒绝后，原候选 $y_{i+1}$ 的条件前缀已经失效。因此不能跳过拒绝位置后继续接受后缀。这是 rejection cascade 的根源。
-
-### 2.4 速度模型
-
-若各位置条件接受率近似为 $\alpha$，一轮平均接受的 draft token 数为：
+首次拒绝发生在位置 $i$ 时，从残差分布采样修正 token：
 
 $$
-\mathbb{E}[A]=\sum_{i=1}^{\gamma}\alpha^i
+p_i'(x)=
+\operatorname{norm}\left([p_i(x)-q_i(x)]_+\right).
 $$
 
-加上必然输出的修正或 bonus token，一轮平均发射：
+若所有候选均被接受，则从 $p_{\gamma+1}$ 采样 bonus token。该修正拒绝采样保持每一步条件分布，因此完整生成序列的联合分布与直接 target 采样一致。[Leviathan et al., 2023](https://proceedings.mlr.press/v202/leviathan23a.html) 和 [Chen et al., 2023](https://arxiv.org/abs/2302.01318) 独立给出了这一结果。
+
+首次拒绝后必须丢弃整个 draft 后缀：后续 $q_{i+1}$ 条件于已被拒绝的 $y_i$，其条件前缀已经失效。
+
+实现必须保留 drafter 实际采样所用的 $q_i$。$p_i$ 是 target 在当前前缀和输出约束下的目标分布，$q_i$ 是实际 proposal；二者本来就不相同，但都必须包含运行时真正施加于各自的 temperature、top-k、top-p、grammar 等变换。不能用 raw logits、错误归一化的稀疏分布或另一套 proposal 代替。仅比较两个模型采样出的 token 是否相同，不能保证分布无损。
+
+### 2.4 速度条件
+
+若各位置条件接受率近似为常数 $\alpha$，一轮平均输出 token 数为：
 
 $$
-\mathbb{E}[L]=\sum_{i=0}^{\gamma}\alpha^i
-=\frac{1-\alpha^{\gamma+1}}{1-\alpha}
+\mathbb{E}[L]
+=\sum_{i=0}^{\gamma}\alpha^i
+=\frac{1-\alpha^{\gamma+1}}{1-\alpha}.
 $$
 
-单位置的理论接受率满足：
+单位置的理论接受率为：
 
 $$
-\alpha=\sum_x\min(p(x),q(x))
-=1-\operatorname{TV}(p,q)
+\alpha=\sum_x\min(p(x),q(x))=1-\operatorname{TV}(p,q).
 $$
 
-实际每 token 延迟近似为：
+这是简化模型。真实接受率随位置下降，且不同请求差异明显。更实用的端到端近似为：
 
 $$
 T_{\text{token}}
-=\frac{T_{\text{draft}}(\gamma)+T_{\text{verify}}(B,V)+T_{\text{runtime}}}
-{\mathbb{E}[L]}
+=
+\frac{
+T_{\text{draft}}+
+T_{\text{verify}}(B,V)+
+T_{\text{sample}}+
+T_{\text{runtime}}
+}{
+\mathbb{E}[L]
+},
 $$
 
-$B$ 是活跃请求数，$V$ 是本轮总验证 token 数。真实 $T_{\text{verify}}$ 随模型、batch、上下文、候选树、kernel 和并行配置变化，不能视为常数。
+其中 $B$ 是请求数，$V$ 是总验证 token 数。高并发时 target 已接近 compute-bound，增加 $V$ 可能使验证成本近似线性增长。因此接受长度提高，不必然带来同比吞吐提升。
 
-本文后续统一使用：
+报告实验时必须区分：
 
-- **accepted draft tokens**：一轮通过验证的 draft token 数，不含修正/bonus token；
-- **emitted tokens per cycle**：一轮最终提交的 token 数，包含修正/bonus token；
-- **acceptance rate**：需注明是逐 token、逐位置还是整块接受率。
+| 指标 | 含义 |
+|---|---|
+| accepted draft tokens | 通过验证的 draft token，不含修正或 bonus |
+| acceptance length | 常见实现中的每轮输出长度，通常包含 target bonus；必须核对定义 |
+| emitted tokens per cycle | 一轮最终提交的 token 数 |
+| throughput | 单位时间内完成的输出 token，受 batch 和调度影响 |
+| per-user speed | 单请求 decode 速度，与 aggregate throughput 不等价 |
 
-## 3. 设计空间
+## 3. 研究脉络与设计空间
 
-### 3.1 Drafter 来源
+### 3.1 关键发展
 
-| 类别 | 代表方法 | 主要优点 | 主要代价 |
-|---|---|---|---|
-| 独立小语言模型 | 经典 speculative sampling、DistillSpec | 可复用现有小模型；线性候选简单 | 需要额外权重和 KV；tokenizer/分布可能不匹配 |
-| 自投机 | Draft & Verify、LayerSkip | 共享主模型参数；少一套模型 | 浅层输出质量有限；常需训练或逐模型选层 |
-| 检索与匹配 | LLMA、REST、prompt lookup、n-gram/suffix | 无神经 drafter；重复文本上便宜 | 收益依赖输入或语料重叠 |
-| 多预测头 | Blockwise、Medusa、Hydra、并行 MTP | 一次产生多个位置/分支 | 各位置独立时缺少块内条件依赖 |
-| Feature drafter | EAGLE 系列 | 复用 target hidden，draft-target 对齐较好 | 需配套训练；target 耦合强 |
-| 原生顺序 MTP | DeepSeek-V3 MTP | 与 target 联合训练；共享 embedding/head | checkpoint 必须原生包含；draft 仍有顺序依赖 |
-| 并行 block drafter | DFlash | 一次 forward 生成整块 | 独立位置产生 suffix decay |
-| 半自回归 block drafter | DSpark | 并行主干兼顾块内依赖 | 模型和系统调度更复杂 |
+| 时间 | 工作 | 核心推进 |
+|---|---|---|
+| 2018 | [Blockwise Parallel Decoding](https://arxiv.org/abs/1811.03115) | 多 offset head 并行预测未来 token |
+| 2022 | [SpecDec](https://arxiv.org/abs/2203.16487) | 专门训练 drafter 与并行 verifier |
+| 2022--2023 | [Speculative Decoding](https://proceedings.mlr.press/v202/leviathan23a.html)、[Speculative Sampling](https://arxiv.org/abs/2302.01318) | 建立分布无损的修正拒绝采样 |
+| 2023 | [SpecInfer](https://arxiv.org/abs/2305.09781)、[REST](https://arxiv.org/abs/2311.08252) | token tree 与检索式候选 |
+| 2024-01 | [Medusa](https://arxiv.org/abs/2401.10774)、[EAGLE](https://arxiv.org/abs/2401.15077) | 多预测头与 feature autoregression |
+| 2024-02 | [Sequoia](https://arxiv.org/abs/2402.12374) | 按接受率和硬件代价优化候选树 |
+| 2024-04 | [MTP](https://arxiv.org/abs/2404.19737) | 将多未来 token 预测作为训练目标 |
+| 2024-12 | [DeepSeek-V3](https://arxiv.org/abs/2412.19437) | 顺序 MTP module 作为原生 drafter |
+| 2025-03 | [EAGLE-3](https://arxiv.org/abs/2503.01840) | 多层特征融合与直接 token 目标 |
+| 2026-02 | [DFlash](https://arxiv.org/abs/2602.06036) | 一次并行前向生成候选块 |
+| 2026-07 | [DSpark](https://arxiv.org/abs/2607.05147) | 半自回归校正与置信度调度 |
+| 2026-08 | [DFlash 2](https://inco.ai/blog/dflash2/) | 路径选择器与动态局部卷积；技术发布 |
 
-### 3.2 候选拓扑
+### 3.2 四个分类轴
 
-**线性 block** 只提出一条长度为 $\gamma$ 的路径。验证简单，但前部一次错误会丢弃整个后缀。
+不同工作应沿独立维度比较，不能混成单一方法列表。
 
-**Token tree** 在每层保留多个候选，增加至少一条路径命中 target 的概率。树可在物理张量中 flatten，但每个节点只能看到共享前缀和自己的祖先；兄弟节点不能互相注意。position id 由树深度决定，而不是 flatten 后的数组下标。
+| 维度 | 主要选项 |
+|---|---|
+| 信息来源 | 独立小 LM、target hidden、原生 MTP、检索/ngram、自投机 |
+| 块内依赖 | 独立多头、feature autoregression、顺序 token correction、局部卷积、并行块建模 |
+| 候选结构 | 线性块、静态树、动态树 |
+| 验证预算 | 固定长度、按置信度动态长度、按硬件 cost profile 动态长度 |
 
-**动态树** 根据当前上下文的 draft confidence 分配节点预算。树越大通常接受得更多，但 target 要验证更多节点，临时 KV、LM head 和采样成本也增加。
-
-**Ragged block** 为同一 batch 内不同请求选择不同验证长度，再沿 token 轴紧凑打包。逻辑边界由 `cu_seqlens`、`qo_indptr`、position 和 mask 表达。
+Ragged layout 不是候选拓扑，而是批处理布局：不同请求可以选择不同验证长度，再通过 `indptr` 和 sequence metadata 紧凑打包。
 
 ### 3.3 正确性等级
 
 | 表述 | 准确含义 |
 |---|---|
-| 分布无损 | 使用精确修正拒绝采样，最终分布等于 target |
-| Greedy 一致 | temperature=0 时 token 序列与 target argmax 相同 |
-| 质量近似不变 | 任务指标或人工评价接近，但分布已经改变 |
-| 近似接受 | typical/阈值/lenience 等规则扩大接受范围，以质量换速度 |
+| 分布无损 | 使用精确 proposal 和修正拒绝采样，输出联合分布等于 target |
+| Greedy 一致 | temperature=0 时 token 序列等于 target argmax |
+| 质量近似不变 | 任务指标接近，但输出分布已经改变 |
+| Relaxed acceptance | 用阈值、typical acceptance 等扩大接受范围 |
 
-论文或实现声称“lossless”时，必须核对它使用哪种接受规则。Medusa 的严格 rejection sampling 可以无损；typical acceptance 不是原分布无损。
+论文中的最大加速不能直接横向比较。模型、硬件、batch、采样、候选宽度、offloading 和 baseline 任一项变化，都可能改变结果。
 
-## 4. 发展过程
+## 4. 自回归与原生 drafter
 
-| 时间 | 工作 | 核心推进 |
-|---|---|---|
-| 2018 | [Blockwise Parallel Decoding](https://arxiv.org/abs/1811.03115) | 多个 offset head 并行预测未来 token，再接受 target 认可的最长前缀 |
-| 2022-03 | [SpecDec](https://arxiv.org/abs/2203.16487) | 专门训练 drafter 与并行 verifier，主要面向 greedy/seq2seq |
-| 2022-11 / 2023 | [Fast Inference via Speculative Decoding](https://proceedings.mlr.press/v202/leviathan23a.html) | 给出保持 target 分布的修正拒绝采样与速度分析 |
-| 2023-02 | [Speculative Sampling](https://arxiv.org/abs/2302.01318) | 独立提出同类精确采样算法并在分布式大模型上验证 |
-| 2023-04 | [LLMA](https://arxiv.org/abs/2304.04487) | 从 reference 文本复制候选 span，适合 RAG 与文本改写 |
-| 2023-05 | [SpecInfer](https://arxiv.org/abs/2305.09781) | 多 drafter token tree 与 tree-based parallel verification |
-| 2023-09 | [Draft & Verify](https://arxiv.org/abs/2309.08168) | 跳过 target 的部分中间层完成 self-speculation |
-| 2023-10 | [DistillSpec](https://arxiv.org/abs/2310.08461) | 用 on-policy 蒸馏和任务相关散度提高 draft-target 对齐 |
-| 2023-11 | [REST](https://arxiv.org/abs/2311.08252) | 从外部 datastore 检索 continuation 并以树验证 |
-| 2024-01 | [Medusa](https://arxiv.org/abs/2401.10774) | 在 target hidden 上增加多个未来 token head，以树组织候选 |
-| 2024-01 | [EAGLE](https://arxiv.org/abs/2401.15077) | 在 feature 层自回归，并用 shifted token 消除采样不确定性 |
-| 2024-02 | [Lookahead Decoding](https://arxiv.org/abs/2402.02057) | Jacobi 迭代并行收集、验证 n-gram，无独立 drafter |
-| 2024-02 | [Hydra](https://arxiv.org/abs/2402.05109) | 让多预测头显式依赖此前候选，缓解 Medusa 头间独立 |
-| 2024-02 | [Sequoia](https://arxiv.org/abs/2402.12374) | 动态规划设计 token tree，并按硬件实测代价选择树 |
-| 2024-04 | [LayerSkip](https://arxiv.org/abs/2404.16710) | layer dropout 与 early-exit loss 支持浅层 self-drafter |
-| 2024-04 | [Multi-Token Prediction](https://arxiv.org/abs/2404.19737) | 将多未来 token 预测作为训练目标和推理候选来源 |
-| 2024-06 | [EAGLE-2](https://arxiv.org/abs/2406.16858) | 用 context-aware confidence 动态构造 draft tree |
-| 2024-08 | [MagicDec](https://arxiv.org/abs/2408.11049) | 分析长上下文、高 batch 下 KV 瓶颈，并使用稀疏 draft KV |
-| 2024-12 | [DeepSeek-V3](https://arxiv.org/abs/2412.19437) | 顺序 MTP module 联合预训练，并作为原生 drafter |
-| 2025-03 | [EAGLE-3](https://arxiv.org/abs/2503.01840) | 多层 feature fusion、直接 token 目标和 training-time test |
-| 2026-02 | [DFlash](https://arxiv.org/abs/2602.06036) | block diffusion drafter 一次 forward 并行产生候选块 |
-| 2026-07 | [DSpark](https://arxiv.org/abs/2607.05147) | 半自回归 block drafter 与按请求、按负载的验证调度 |
+### 4.1 EAGLE：在特征空间自回归
 
-这条路线的主线不是单纯扩大 drafter：研究重点逐渐从“提出候选”扩展到 draft-target 对齐、树/块结构、训练分布偏移、KV 生命周期，以及高并发下的验证预算。
-
-## 5. EAGLE 系列
-
-### 5.1 EAGLE-1：Feature Autoregression
-
-EAGLE 预测 target 倒数第二层，即 LM head 之前的 feature，而不是直接用一个小 LM 预测 token。主要观察是：feature 自回归比 token 自回归更容易对齐 target，但 feature 本身不能唯一确定此前实际采样了哪个 token。
-
-EAGLE 将向前错一位的真实 token embedding 一同输入 drafter：
+EAGLE 预测 target LM head 前的 feature，并将向前错一位的已选 token embedding 一同输入：
 
 ```text
 target features: f_1, ..., f_t
 shifted tokens:  t_2, ..., t_(t+1)
-                    |
-             FC + one decoder layer
-                    |
-              predict f_(t+1)
-                    |
-          frozen target LM head -> q_(t+1)
+                       |
+                 lightweight drafter
+                       |
+                  predict f_(t+1)
+                       |
+                target LM head -> q
 ```
 
-shifted token 显式告诉 drafter 上一步实际选择了什么，消除“相同 feature 分布对应不同已采样 token”的不确定性。训练包含 feature regression 与 token classification/distillation。推理时多步自回归地产生 feature/token，组成固定 token tree，再由 target 使用 tree attention 一次验证。
+shifted token 显式给出上一步实际选择，消除“feature 相似但离散 token 不同”的不确定性。EAGLE-2 根据 path confidence 动态分配树节点；EAGLE-3 融合 target 多层 feature，取消 feature regression，直接优化 draft token，并在训练中回灌 drafter 自己的 latent 以减轻 exposure shift。
 
-### 5.2 EAGLE-2：动态树
+EAGLE 的优势是 target 对齐强；代价是多步 feature autoregression、树构造和 tree attention verification。
 
-EAGLE-2 不更换 EAGLE-1 drafter，也不要求重新训练。它改变候选树的预算分配：
+### 4.2 MTP：训练目标不等于推理加速
 
-1. 以 draft token probability 估计局部接受率。
-2. 节点 path score 为祖先 confidence 的乘积。
-3. 优先扩展高 path score 的 frontier。
-4. 在固定节点预算下保留最可能通过的连通子树。
-
-所以 EAGLE-2 是树构造策略，不是新的预测模型。SGLang 配置中的 `EAGLE` 通常指 EAGLE feature drafter 加 EAGLE-2 动态树。
-
-### 5.3 EAGLE-3：直接 token 目标
-
-EAGLE-3 取消的是 **feature regression 约束**，不是完全不使用 target feature。它融合 target 低、中、高层 hidden state，直接优化 draft token 分布。
-
-原 EAGLE 训练主要看到真实 target feature，但多步推理会回灌 drafter 自己产生的 latent，存在 exposure shift。EAGLE-3 的 training-time test 在训练中展开并模拟后续 draft step，把 drafter 自己输出的 latent 回灌为下一步输入，使训练上下文接近推理上下文。
-
-主要变化是：
-
-- top-layer feature 改为多层 feature fusion；
-- feature regression 改为直接 token distillation；
-- 训练时模拟多步 draft；
-- 候选仍可结合 EAGLE-2 动态树验证。
-
-论文报告的最高 `6.5x` 是特定模型、任务和 batch=1 实验上限；其 SGLang 实验在 batch size 64 报告约 `1.38x` throughput。它们不能作为任意部署的默认收益。
-
-## 6. MTP：训练目标与推理 drafter
-
-MTP 首先是一种训练目标：在位置 $t$ 不只预测 $x_{t+1}$，还预测更远的未来 token。它是否能加速推理，取决于是否把这些预测接入 target verification。
-
-### 6.1 并行多头 MTP
-
-[Gloeckle et al.](https://arxiv.org/abs/2404.19737) 在共享 model trunk 上放置 $D$ 个独立输出 head：
+并行 MTP head 在共享 trunk 上直接预测多个未来位置：
 
 $$
-h_t \rightarrow \{q(x_{t+1}),q(x_{t+2}),...,q(x_{t+D})\}
+h_t\rightarrow
+\{q(x_{t+1}),q(x_{t+2}),\ldots,q(x_{t+D})\}.
 $$
 
-所有 head 可并行执行，但远端 head 没有显式看到前面实际选择的 token，因此可能产生块内不一致。Medusa 属于相近设计，并进一步用 top-k 笛卡尔积构造候选树。
+其远端 head 没有显式看到前面实际选择的 token，可能产生块内不一致。DeepSeek-V3 改用顺序 MTP module：训练时使用 teacher-forced future token embedding，推理时使用前一 MTP 步实际提出的 token，因此保留条件链，但 draft latency 随深度增长。
 
-### 6.2 DeepSeek-V3 顺序 MTP
+MTP 只有接入 target verification 才能加速。直接提交多个 MTP token 会改变 target 解码结果。
 
-DeepSeek-V3 使用顺序 MTP module。训练时，第 $k$ 个 module 接收前一深度 hidden 与 teacher-forced 的第 $k$ 个未来 token embedding，经归一化、拼接、投影和一个 Transformer block，预测再下一个 token：
+## 5. DFlash：并行块草拟
+
+### 5.1 基本结构
+
+DFlash 用轻量 block diffusion drafter 一次预测整个候选块。target 多层 hidden 被融合并投影为 drafter 各层 K/V，使每个 draft layer 都能读取正式上下文：
+
+```text
+target hidden from selected layers
+              |
+         fuse / project
+              |
+       persistent draft K/V
+
+[anchor, MASK, MASK, ...]
+              |
+   block diffusion backbone
+              |
+   logits for all positions
+```
+
+与自回归 drafter 相比，重型 draft backbone 只执行一次，$T_{\text{draft}}$ 不再随候选长度近似线性增长。
+
+### 5.2 DFlash 的误差来源
+
+“DFlash 各位置完全独立”并不准确。MASK hidden 可以通过非 causal attention 交互。缺少的是：位置 $t$ 没有显式条件于位置 $t-1$ 最终选中的离散 token。
+
+可将误差拆为三层：
+
+1. **Candidate coverage**：正确 token 是否在当前位置的 top-k 中。
+2. **Path selection**：候选集合中存在正确 token 时，能否选出条件一致的路径。
+3. **Suffix coverage**：越靠近块尾，正确 token 是否仍在候选集合中。
+
+普通 DFlash 每个位置独立取 top-1，同时受到 selection error 和 suffix decay。增加 backbone 深度可缓解后者，但会损害并行 drafter 的延迟优势。
+
+### 5.3 DSpark：半自回归校正
+
+DSpark 先用 DFlash backbone 产生整块 hidden 和基础 logits，再用轻量顺序模块引入实际 token 前缀：
+
+- Markov head 仅条件于前一个 token；
+- RNN head 条件于完整块内前缀；
+- confidence head 预测在此前 token 均被接受条件下，当前位置继续存活的概率。
+
+Markov head 用低秩转移近似完整 $V\times V$ 矩阵：
 
 $$
-h_i^{(k)}=\operatorname{TRM}_k\left(
-M_k\left[\operatorname{RMSNorm}(h_i^{(k-1)});
-\operatorname{RMSNorm}(\operatorname{Emb}(x_{i+k}))\right]
-\right)
+B(x_{k-1},\cdot)=W_1[x_{k-1}]W_2.
 $$
 
-embedding 和 LM head 与主模型共享，各深度使用交叉熵监督。作为 speculative drafter 推理时，真实未来 token 不可知，第 $k$ 个 module 改为输入前一 MTP 步实际提出/采样的 token。与并行独立 head 相比，顺序 module 因而保留完整条件链；代价是 draft latency 随步数增长。
+DSpark 的系统贡献同样重要：调度器根据每请求置信度和硬件 step-time profile 选择验证长度。它同时优化候选质量与高并发下无效验证 token 的机会成本。
 
-公开 DeepSeek-V3 权重包含一个 MTP module。官方权重说明给出的口径是 `11.5B unique parameters`，不含共享 embedding 和 output head；`activation parameters` 为 `2.4B`，其中包含共享 embedding 和 output head 各 `0.9B`。共享部分不构成额外权重开销。[权重结构](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/README_WEIGHTS.md)
+## 6. DFlash 2
 
-DeepSeek-V3 报告中，第二 token 的接受率为 `85%-90%`，并报告 `1.8x TPS`。这是其模型和部署条件下的结果。MTP 候选仍需主模型验证，不能直接无条件提交。
+官方名称为 **DFlash 2**，也常写作 DFlash-2。它不是 SGLang 的 Spec V2 runtime，也不是第二轮 diffusion。其结构是：
 
-### 6.3 与 EAGLE 的区别
+```text
+DFlash backbone
+    |
+    +-- grouped dynamic local convolution -> 改善块尾候选覆盖
+    |
+    +-- target LM head top-k
+             |
+       candidate lattice
+             |
+       short path walk -> 改善离散路径选择
+             |
+       target linear verification
+```
 
-| 维度 | DeepSeek-V3 MTP | EAGLE-3 |
+首批公开权重面向 Qwen3.8-27B 和 Muse Glimmer 30B，配置中的 block size 分别为 8 和 16。block 包含一个 anchor，因此实际提出 7 或 15 个 draft token。
+
+### 6.1 候选路径选择器
+
+对每个位置保留 top-$K$ 候选。公开 checkpoint 使用 $K=16$。给定前驱 token $a$、当前候选 $b$ 和当前位置 hidden $h_t$，转移分数为：
+
+$$
+S_t(a,b)
+=U_t(b)
++\left\langle
+A(a)\odot H(h_t),B(b)
+\right\rangle.
+$$
+
+- $U_t(b)$：DFlash 原始 unary logit；
+- $A(a),B(b)$：前驱和后继 token 的低秩 codebook；
+- $H(h_t)$：上下文门控；
+- 公开 checkpoint 的 selector rank 为 256。
+
+第一个位置以前一轮 target 验证后的 anchor 为前驱；之后以前一位置实际选中的 token 为前驱。
+
+这不是对完整 lattice 做全局 Viterbi。实现从 anchor 开始逐位置执行局部 greedy 或 sampling：
+
+```text
+prev_idx = 0  # 首位置使用 anchor 对应的等价 predecessor row
+for position t:
+    scores = lattice[t, prev_idx, :]
+    cur_idx = argmax(scores) or sample(scores)
+    token = candidate_ids[t, cur_idx]
+    prev_idx = cur_idx
+```
+
+`lattice` 的 predecessor 维是上一位置候选的局部索引，不是词表 token ID。所有 $K\times K$ 相邻转移分数可以并行计算；首位置的 anchor 被展开为等价 predecessor row。最终 walk 仍沿长度方向顺序执行，但每步只在 $K$ 个候选中选择，不需要再次运行 backbone 或完整 LM head。
+
+### 6.2 为什么 selector 有效
+
+作者在 Qwen3-4B、GSM8K、七个 draft 位置的分析中报告：
+
+- 第一个位置 Recall@1 为 `85.4%`，Recall@16 为 `99.5%`；
+- 块尾 Recall@1 为 `72.9%`，Recall@16 仍为 `87.8%`；
+- top-1 的平均 acceptance length 为 `4.27`；
+- top-16 oracle path 的对应值为 `6.79`。
+
+二者差距说明大量错误来自 selection，而不是候选集合完全缺失正确 token。selector 的作用是从已有候选中恢复局部一致性。
+
+该 oracle 不是可实现性能。它用于诊断 selection gap 与 coverage gap；这是一种实验归因方法，不是严格的概率恒等式。
+
+### 6.3 动态局部卷积
+
+selector 无法恢复未进入 top-k 的 token。DFlash 2 在每个 drafter layer 的 attention 和 MLP 子层前后加入 grouped dynamic causal depthwise convolution。公开模型使用两个 tap：
+
+$$
+\operatorname{Conv}(x)_t
+=k_{t,0}\odot x_t
++k_{t,1}\odot x_{t-1}.
+$$
+
+系数由静态 base kernel 与输入相关修正组成：
+
+$$
+k_{t,j}=k^{\text{base}}_j+\Delta_j(x_t).
+$$
+
+每 16 个 channel 共享一组动态修正。卷积的作用范围仅在当前候选块：
+
+- 第一个待预测 slot 读取 anchor representation；
+- 后续 slot 读取并行块内前一个 slot 的 hidden representation；
+- 所有位置同时计算；
+- 跨 block 不保留卷积状态；
+- 不改变 target verification。
+
+卷积发生在 selector 之前，输入仍是并行 MASK slot；它不读取 path walk 已选 token。显式离散前驱条件只存在于 selector。卷积提供局部连续表示的归纳偏置，让 attention 更集中于读取长上下文。
+
+作者在五层 Qwen3-4B drafter 上报告：
+
+- convolution 增加约 `3%` 参数和 `0.7%` draft--verify cycle latency；
+- 其块尾 Recall@1 接近十五层 DFlash；
+- 十层额外 Transformer layer 的 cycle latency 增量为 `15.2%`。
+
+这一结果支持“suffix decay 主要是局部依赖建模不足”的假设，但证据目前来自作者实验，尚缺不同模型和领域上的独立验证。
+
+### 6.4 并行性的边界
+
+DFlash 2 保持并行，准确含义是：
+
+- block backbone：一次并行前向；
+- LM head：一次处理所有位置；
+- top-k 与 $K\times K$ lattice：并行；
+- local convolution：所有位置并行；
+- path walk：长度方向存在短顺序依赖；
+- target verification：一次线性 causal 前向。
+
+所以它消除的是昂贵模型层的自回归循环，而不是所有顺序控制流。
+
+### 6.5 采样仍然精确
+
+selector 在 temperature $>0$ 时定义稀疏 proposal：
+
+$$
+q_t(b\mid a,h_t),\qquad
+b\in\operatorname{TopK}(U_t).
+$$
+
+运行时保存实际路径每一步的 $q_t$。target 给出 $p_t$ 后，仍使用标准接受概率和 residual distribution。top-k 外的 proposal 概率为零，但 target residual 可以采样这些 token，因此最终 target 分布不受 selector 支持集限制。
+
+greedy 模式直接执行逐位置 target argmax 比较；随机模式才使用 $q_t$ 和修正拒绝采样。不能把 greedy 路径作为 point-mass proposal 代入随机验证公式。DFlash 2 改变的是 proposal，不改变两类 verifier 各自的正确性条件。
+
+### 6.6 训练目标尚未公开
+
+截至本文日期，官方博客、权重和仓库公开了推理结构，但没有公开完整训练 loss、数据配方与训练流程。仅从 inference codebook 和 checkpoint 形状，不能判断 selector 的全部训练方式或参数约束。
+
+[SpecForge PR #772](https://github.com/sgl-project/SpecForge/pull/772) 与 [vLLM Speculators PR #1006](https://github.com/vllm-project/speculators/pull/1006) 给出了社区实验方案，而非官方 recipe。其共同思路是保留 DFlash unary objective，再加入带权 selector $K$ 分类交叉熵；若 gold token 不在 unary top-k 中，只在训练 loss 的候选集合中注入 gold，服务路径和严格 Recall@K 仍使用真实 top-k。后一个 PR 明确将该目标标为实验性实现。
+
+这一区分对应两个不同目标：
+
+1. unary backbone 提高正确 token 的 Recall@K；
+2. selector 在候选已覆盖时学习条件路径。
+
+训练评估应分别报告真实 Recall@K、teacher-forced selector accuracy 和自回归选路后的 acceptance。只报告训练候选集上的 selector accuracy 会掩盖 coverage error 与 exposure shift。
+
+## 7. 方法对比
+
+| 方法 | 重型 draft 关键路径 | 离散块内条件 | 候选结构 | 动态验证预算 | 主要代价 |
+|---|---|---|---|---|---|
+| EAGLE-3 | 多步 feature autoregression | 显式使用已选 token | 动态树 | 通常固定树预算 | 多步 drafter、tree attention |
+| 原生 MTP | 多个顺序 MTP module | 显式 | 线性 | 通常固定 | checkpoint 耦合、顺序 module |
+| DFlash | 一次并行 backbone | 无已选 token 条件 | 线性 | 固定 | selection error、suffix decay |
+| DSpark | 并行 backbone + 轻量顺序校正 | Markov/RNN | 线性 ragged | confidence scheduling | 顺序校正、校准与 cost profile |
+| DFlash 2 | 并行 backbone/conv + 短 path walk | selector 中局部一阶条件 | 线性 | 当前固定 | top-k、codebook、walk、dense $q$ |
+
+DFlash 2 提高固定候选块的质量，DSpark 还控制每请求的 verification budget；二者可以组合，不是简单的新旧替代。
+
+## 8. 代码级运行链路
+
+### 8.1 公开实现
+
+主要一手代码入口：
+
+- [z-lab PyTorch/Transformers 实现](https://github.com/z-lab/dflash/blob/main/dflash/model.py)
+- [z-lab MLX 实现](https://github.com/z-lab/dflash/blob/main/dflash/model_mlx.py)
+- [SGLang 模型与 selector](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/dflash.py)
+- [SGLang draft/verify worker](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/speculative/dflash_worker_v2.py)
+- [SGLang Triton walk kernel](https://github.com/sgl-project/sglang/blob/main/python/sglang/kernels/ops/speculative/dflash.py)
+- [vLLM DFlash 2 PR](https://github.com/vllm-project/vllm/pull/52816)
+- [llama.cpp DFlash 2 PR](https://github.com/ggml-org/llama.cpp/pull/27342)
+
+### 8.2 一轮完整执行
+
+```text
+初始化：target prefill
+   -> 捕获已提交前缀的指定层 hidden
+   -> 投影并建立初始 draft context/KV
+
+稳态第 n 轮：
+1. 构造 draft block
+   -> [pending anchor, MASK, ..., MASK]
+   -> 为 block 预留 draft/target 临时 KV slots
+
+2. DFlash 2 forward
+   -> dynamic local convolution
+   -> parallel block hidden
+
+3. candidate selection
+   -> target LM head over all draft positions
+   -> per-position top-k
+   -> K x K adjacent transition lattice
+   -> greedy/sample path walk
+   -> 保存 selected tokens 与 proposal q
+
+4. target verification
+   -> [anchor, selected_1, ..., selected_gamma]
+   -> 普通 linear causal attention
+   -> 捕获本轮 target hidden
+   -> greedy comparison 或 rejection sampling
+
+5. commit / 跨轮反馈
+   -> 提交 anchor + accepted drafts 的 target KV
+   -> 将已提交位置的 target hidden 投影并写入 draft context/KV
+   -> 丢弃 rejected suffix
+   -> correction/bonus 成为下一轮 pending anchor
+```
+
+DFlash 2 只提出一条路径，所以 target 使用普通 causal mask，不需要 tree attention。prefill 仅在初始化执行一次；稳态每轮只有第 4 步的一次 target forward，本轮提交的 hidden 供下一轮 drafter 使用。
+
+### 8.3 KV Cache
+
+target KV 与 draft KV 属于不同模型状态：
+
+- target verification 会为整个 `[anchor, drafts...]` 写临时 KV；
+- 逻辑序列只提交 anchor 和已接受 draft；
+- rejected suffix 的 KV 不进入下一轮有效长度；
+- correction/bonus 由 logits 得到，尚无 KV；
+- drafter 还需把已提交位置的 target hidden 投影为后续 draft context。
+
+历史 KV 不会先 `concat` 成连续 tensor。Radix Cache 决定前缀命中及已有 KV slot 的复用；attention kernel 通过 page table 或 `req_to_token` 映射读取这些 slot。当前验证块只提供新的 query 和临时 slot 地址。
+
+SGLang Spec V2 为 overlap 预留额外 lookahead slot，并分别维护 committed length 与临时 block。这里的 “V2” 是运行时架构，不是 DFlash 2 算法。
+
+### 8.4 Selector 的工程实现
+
+SGLang 先构造：
+
+```text
+candidate_ids: [B, L, K]
+unary_logits:  [B, L, K]
+lattice:       [B, L, K, K]
+```
+
+随后每个请求由一个 Triton program 完成 path walk。每一行的 $K$ 个分数保存在寄存器中，长度方向循环位于单个 kernel 内，避免每个位置发射一次 kernel。
+
+PyTorch 和 MLX 参考实现则在 Python 中逐位置计算实际前驱对应的一行分数。数学含义相同，但系统开销不同。讨论“DFlash 2 latency”时必须注明具体 runtime。
+
+### 8.5 随机验证的数据布局
+
+selector 的 proposal 只在 top-k 上非零。SGLang 当前路径将稀疏 $q$ scatter 到形如 `[B, gamma, vocab]` 的 dense buffer，再复用通用 rejection kernel。
+
+这简化了实现，但产生两个潜在问题：
+
+- 大词表下临时显存以及首次分配或扩容的全量清零成本增加；
+- 稀疏 proposal 的理论优势没有完全传递到 verifier。
+
+buffer 在稳态被复用，每轮只需清理 top-k support，成本为 $O(B\gamma K)$，不是 $O(B\gamma V)$。直接在 `(candidate_ids, q_values)` 上完成接受概率和 residual sampling，仍是值得研究的 kernel 方向。
+
+### 8.6 TP、LM head 与 CUDA Graph
+
+DFlash 2 复用 target embedding 和 LM head。TP 下每个 vocab shard 先计算 local top-k，再 all-gather `TP × K` 个候选并做 global top-k，避免聚合完整词表 logits。
+
+selector 的 predecessor/successor codebook 需要任意 token 行，因此 SGLang 在每个 TP rank 复制它们。对词表 $V$、selector dimension $d$，两张表规模为 $2Vd$。大词表下其存储和显存带宽不能忽略。
+
+例如 Qwen3.8 的实现形状为 $V=248{,}320,d=256$：两张 codebook 共约 1.27 亿个 scalar，BF16 存储约 243 MiB，并在每个 TP rank 复制。作者博客中的 selector 参数增量口径不能直接解释为部署显存增量。
+
+公开 SGLang 实现还具有以下约束：
+
+- FlashInfer radix top-k 是关键优化；回退到 `torch.topk` 会显著降速；
+- dense target LM head 时，top-k、lattice 和 walk 可折入 draft CUDA Graph；
+- 截至本文日期，量化 target LM head 支持仍在独立 PR 中，不能默认与 dense 路径等价；
+- sampled path 需要把真实 $q$ 带到 verifier。
+
+这些细节说明 DFlash 2 的低理论 FLOPs 不自动等于低 runtime latency。
+
+## 9. 已有实验
+
+### 9.1 证据等级
+
+| 来源 | 可支持的结论 | 局限 |
 |---|---|---|
-| 训练时机 | 与 target 联合预训练 | 通常冻结既有 target 后训练外挂 drafter |
-| 条件输入 | 前一 MTP hidden + future token embedding | target 多层 feature + 已采样 token + draft latent |
-| 结构 | 顺序 MTP module | 轻量 feature-conditioned drafter |
-| 权重适配 | checkpoint 原生包含 | 每个 target 通常需要配套 checkpoint |
-| 验证 | target speculative verification | target tree verification |
+| [DFlash 论文](https://arxiv.org/abs/2602.06036) | DFlash 基线结构与原始实验 | 不包含 DFlash 2 |
+| [DFlash 2 技术博客](https://inco.ai/blog/dflash2/) | 算法、消融和作者结果 | 非同行评审；训练 recipe 未完整公开 |
+| [公开 checkpoint](https://huggingface.co/collections/z-lab/dflash-2) | 模型结构和可部署配置 | 当前仅少量 target |
+| SGLang/vLLM/llama.cpp 实现与 PR | kernel、KV、TP 和 runtime 行为 | 版本快速变化；支持组合有限 |
+| 社区首日测试 | 初步可复现性 | 样本少、硬件和配置不统一 |
 
-## 7. DFlash 与 DSpark
+### 9.2 匹配训练实验
 
-### 7.1 DFlash：并行 block drafter
+作者在 Qwen3.5-4B 上统一训练 DFlash、DSpark 和 DFlash 2，并使用 thinking、temperature `1.0`、top-p `0.95`、top-k `20`、presence penalty `1.5` 和无损 rejection sampling。
 
-DFlash 用轻量 block diffusion model 一次 forward 预测整个候选块。它从 target 多层 hidden 提取 context feature，并把投影后的 context 注入 drafter 各层 K/V；这部分状态可缓存在 drafter KV 中。
+五个数据集的平均 acceptance length 为：
 
-```text
-target context features
-       -> fuse/project -> persistent draft K/V
+| 方法 | Mean |
+|---|---:|
+| MTP | 4.54 |
+| DFlash | 4.92 |
+| DSpark | 5.49 |
+| DFlash 2 | **5.97** |
 
-anchor token + masked positions
-       -> block diffusion drafter
-       -> q_1, q_2, ..., q_gamma in one forward
-```
+DFlash 2 相对 DFlash 增加 `1.05` token，约 `21%`；selector 与 convolution 合计增加约 `1.3%` draft--verify cycle latency。
 
-它将 $T_{\text{draft}}$ 从随 $\gamma$ 线性增加改为近似一次并行 pass，因此可以使用更深的 drafter 和更长的 block。问题是各位置没有看到块内其他位置最终采样的 token；存在多种合理续写时，独立边缘预测可能组合成不连贯序列，接受率沿后缀快速下降。
+这是当前唯一匹配训练设置的公开对照。但 acceptance length 包含 verifier token，不等于 accepted draft count，也不能单独推出吞吐提升。
 
-论文报告的 `>6x` 和相对 EAGLE-3 的结果来自其指定模型、任务、block size 与单请求设置，不代表在线高并发吞吐。
+### 9.3 Qwen3.8-27B SGLang 并发基准
 
-### 7.2 DSpark：半自回归 drafting
+[SGLang 合入 PR 的 benchmark](https://github.com/sgl-project/sglang/pull/35371)使用单 H200、FlashAttention 3、block size `8`（1 个 anchor + 7 个 draft token）、temperature `1.0`、top-p `0.95`、top-k `20`、`xhigh` reasoning 和最多 `4096` 个新 token。
 
-DSpark 在 DFlash 式并行 backbone 后增加很轻的顺序模块：
+平均 acceptance length：
 
-1. parallel backbone 一次产生整块 hidden $h_k$ 和 base logits $U_k$；
-2. 顺序 head 根据已采样的块内前缀，为 $U_k$ 加 transition bias；
-3. confidence head 预测每个位置在此前位置已接受条件下的存活率；
-4. scheduler 只选择有正收益的前缀交给 target 验证。
+| MTP | 社区 DSpark | DFlash 2 |
+|---:|---:|---:|
+| 4.28 | 3.62 | **4.80** |
 
-Markov head 只依赖前一个 token，并用低秩矩阵近似 $V\times V$ 转移：
+GSM8K throughput 的代表结果：
 
-$$
-B(x_{k-1},\cdot)=W_1[x_{k-1}]W_2
-$$
+| 并发 | Autoregressive | DFlash 2 | Speedup |
+|---:|---:|---:|---:|
+| 1 | 68.9 tok/s | 236.1 tok/s | 3.43× |
+| 8 | 467.2 tok/s | 1328.7 tok/s | 2.84× |
+| 32 | 1329.8 tok/s | 1922.5 tok/s | 1.45× |
 
-论文默认 rank 为 256。RNN head 维护块内 recurrent state，可以利用完整前缀，但执行和部署更复杂。两者的目标都是用很小的串行开销缓解并行 drafter 的 suffix decay。
+加速比从单请求的 `3.43×` 降至并发 32 的 `1.45×`。高并发 target verification 更接近 compute-bound，额外 draft token 会与有效 token 争用算力。
 
-### 7.3 Confidence-scheduled verification
+### 9.4 当前不能得出的结论
 
-confidence head 输出：
+现有证据不足以证明：
 
-$$
-c_{r,k}=P(\text{位置 }k\text{ 接受}\mid\text{此前位置全部接受})
-$$
+- DFlash 2 在所有模型上优于 EAGLE-3、MTP 或完整 DSpark 系统；
+- selector/convolution 在长上下文、代码、开放式高温采样上均稳定有效；
+- 公开吞吐倍数可迁移到不同 GPU、量化格式、TP 或在线流量；
+- 新增组件只带来博客所述的参数增量，而没有额外 codebook 和 runtime buffer 成本。
 
-请求 $r$ 的长度 $j$ 前缀存活率为：
+截至本文日期，[SGLang PR #35371](https://github.com/sgl-project/sglang/pull/35371) 已合入 main，但晚于当时最新 tag `v0.5.17`；vLLM 与 llama.cpp 支持仍位于开放 PR。稳定 release、量化 LM head 和模型组合需要逐版本核对。
 
-$$
-a_{r,j}=\prod_{i=1}^{j}c_{r,i}
-$$
+## 10. 后续实验设计
 
-训练目标使用 draft 与 target 分布的总变差得到解析接受率：
+本文不执行本地实验。下面给出可证伪的验证方案。
 
-$$
-c^*_{r,k}=1-\frac{1}{2}\|p^d_{r,k}-p^t_{r,k}\|_1
-$$
+### 10.1 正确性
 
-原始 confidence 还要通过 Sequential Temperature Scaling 校准累计存活概率。调度器预先 profile 引擎的 `SPS(B)` 或 step-time 曲线，然后在增加验证 token 的预期收益与边际成本之间选择每个请求的验证长度 $\ell_r$。
-
-高并发时这是关键：若有 $R$ 个请求且每个验证 $K$ 个 draft token，target 工作量从约 $R$ 个 query 扩大到 $R(K+1)$。被首个错误丢弃的低置信度后缀占用了本可服务其他请求的 batch capacity。
-
-调度决策还必须是 non-anticipating：是否纳入第 $k$ 个候选，必须在观察或采样该候选 $x_k$ 前决定；不能让由 $x_k$ 导出的后续 confidence 反过来影响它自身是否被验证，否则会产生 selection bias，破坏 target 分布。DSpark 论文使用 early stopping；异步生产路径使用滞后的 confidence 信号建立因果屏障。
-
-### 7.4 已知边界
-
-- confidence 截断只节省 target verification；parallel backbone 已经生成整块，draft 成本不能回收。
-- 低接受率请求仍支付固定 draft 成本。
-- cost table 与硬件、模型、精度、batch、上下文和 kernel 强耦合。
-- 论文在 DeepSeek-V4 实流量、matched throughput 下报告：V4-Flash 单用户速度提升 `60%-85%`，V4-Pro 提升 `57%-78%`，对照为 MTP-1。极端 SLA 下更大的数字来自基线 throughput cliff，不是通用倍数。
-
-## 8. 从候选到 Kernel 的完整实现
-
-### 8.1 运行链路
-
-```mermaid
-flowchart TD
-    A[Target prefill / 已确认前缀] --> B[初始化或更新 draft state]
-    B --> C[生成线性块、树或 ragged 候选]
-    C --> D[为 target 候选分配临时 KV slots]
-    D --> E[构造 token layout、position、indptr 与 attention mask]
-    E --> F[Target 一次并行 verification forward]
-    F --> G[Greedy compare 或 rejection sampling]
-    G --> H[提交输出 token IDs；仅提交接受路径的 target KV]
-    G --> I[回收拒绝后缀与未选树枝的 KV slots]
-    H --> J[更新请求长度、draft state、page table 与输出]
-    I --> J
-    J --> K{请求结束?}
-    K -- 否 --> C
-    K -- 是 --> L[释放 target/draft 状态]
-```
-
-### 8.2 不是普通 concat
-
-线性候选可以作为 `[sum verify_len]` 紧凑 tensor 传入 target，但逻辑上仍是多个独立请求。常见 autoregressive runtime 中，最后一个已输出 token 是尚未写入 target KV 的 `pending_anchor`；若其后提出 $K$ 个候选，请求的验证段通常是：
-
-```text
-req_r segment = [pending_anchor, draft_0, ..., draft_(K-1)]
-tokens        = concat(req_0_segment, req_1_segment, ...)
-qo_indptr     = [0, len_0, len_0 + len_1, ...]
-positions     = 每个请求从其 target cached_len 开始
-page table = 每个请求自己的 prefix + 临时候选槽位
-```
-
-anchor 行的 target logits 验证 `draft_0`，`draft_i` 行验证 `draft_(i+1)`，最后一行产生 bonus logits。因此提出 $K$ 个候选通常要 forward $K+1$ 个 token，而不是只 forward $K$ 个 draft token。只有另行预计算并保存 anchor logits/KV 的设计才能改变这个对齐关系。
-
-跨请求的 `concat` 只做物理紧凑打包，不会将请求拼成一条文本。varlen attention kernel 通过 `indptr`、sequence length 和 page table 分隔请求。
-
-树候选同样可以 flatten，但还必须传 tree mask 或等价的 parent/ancestor metadata：
-
-```text
-root
-├── A
-│   ├── C
-│   └── D
-└── B
-    └── E
-```
-
-节点 `D` 只能看到正式 prefix、`A` 和自己，不能看到 `B/C/E`。若把 flatten 后的 `[A,B,C,D,E]` 当普通 causal sequence，`D` 会看到错误兄弟节点，logits 和 KV 都不再正确。
-
-### 8.3 KV Cache 生命周期
-
-一次验证通常需要 lookahead slots：
-
-```text
-正式 target KV: [committed prefix........................]
-临时 verify KV:                                      [anchor d0 d1 ...]
-                                                           |
-verification 后仅提交 anchor 与接受路径 ------------------+
-其余 slots free / rewind / remap
-```
-
-实现可选择：
-
-- 先写入请求页表尾部，验证后截断长度并回收尾页；
-- 使用独立临时槽位，接受后将选中路径映射进正式页表；
-- 预留固定 lookahead region，按请求记录 committed length。
-
-关键不变量是：下一轮 attention 只能读取已提交 token 的 KV。拒绝后缀和未选树枝不能留在逻辑序列中。
-
-还要区分“token 已输出”和“其 target KV 已物化”。设验证前已有已提交 KV 前缀 $P$、尚未写 KV 的末 token $a$，drafter 提出 $d_0,\ldots,d_{K-1}$。target verification 输入 `[a,d_0,...,d_(K-1)]`，为 anchor 和候选写入临时 KV。若接受前 $j$ 个候选，提交 $a,d_0,\ldots,d_{j-1}$ 的 KV；本轮 correction/bonus token $z$ 只从 logits 得到，尚未作为 target 输入：
-
-```text
-logical tokens: P + a + accepted drafts + z
-target KV:      P + a + accepted drafts
-                                          ^ 下一轮将 z 作为新的 pending anchor
-```
-
-因此 decode 运行时经常保持一个 token 的逻辑长度与 KV 长度差。mini-SGLang 的请求完成 prefill、进入 decode 队列后，`complete_one()` 使其稳定满足 `cached_len = device_len - 1`，正好表示末 token 等待下一次 forward。新请求或 chunked prefill 的 `extend_len` 可以大于 1，不能把这个等式当作所有阶段的不变量。若实现选择额外 forward 最后一个 token，也可以立即物化其 KV，但这会增加一次 target 计算。
-
-drafter 状态取决于方法：
-
-- 独立小 LM 有自己的 KV Cache，拒绝后也要回滚到已提交前缀；
-- EAGLE 维护 target feature 与 draft KV，token/feature 存在一步错位；
-- MTP 复用主模型 hidden、embedding/head，但 module 状态仍需与接受长度同步；
-- DFlash/DSpark 缓存注入的 target context feature，块内临时状态不应污染下一轮。
-
-### 8.4 连续批处理
-
-同一轮每个请求可能接受不同数量：
-
-```text
-req A: draft 6, accept 5 -> emit 6
-req B: draft 3, accept 0 -> emit 1
-req C: draft 5, accept 2 -> emit 3
-```
-
-请求在轮末分别增加 `6/1/3` 个 token。下一轮 scheduler 根据更新后的长度、剩余输出预算和 KV 页重新组成 batch；请求可以完成、退出，也可以有新请求进入。这仍是 continuous batching，只是“每轮每请求固定推进 1 token”变成了 ragged advancement。
-
-调度器至少要维护：
-
-- 本轮 draft/verify 阶段；
-- 每请求 proposed、scheduled、accepted、committed 长度；
-- target 与 draft 的临时 KV 所有权；
-- verify token budget，而不只是 request count；
-- abort、EOS、`max_tokens` 在一轮多 token 输出中的截断；
-- overlap 时跨轮 confidence、future 和资源释放顺序。
-
-### 8.5 CUDA Graph
-
-普通 decode graph 常固定为 `[batch, q_len=1]`。投机验证同时改变 batch、每请求 query length、总 token 数和树结构。常见方案是：
-
-- 固定 `(batch, draft_len, tree_shape)` capture，多余位置 padding；
-- 按总验证 token 数 capture buckets；
-- 将 ragged token 前向紧凑打包，再向最近 graph tier padding；
-- 为 tree metadata、page table、positions、draft probs 使用持久 device buffer。
-
-SGLang 的 DSpark 开发/固定提交复现路径按 ragged 总 token 数选择 graph tier，因此缩短验证窗口会实际减少 target 的 MLP/attention 行数，而不是只在固定宽度 graph 中加 mask。[SGLang DSpark 实现说明](https://www.lmsys.org/blog/2026-07-06-dspark-sglang/)
-
-### 8.6 并行与其他特性
-
-- **TP**：target 和 neural drafter 各自按层切分；LM head 的全词表概率、top-k 和 rejection sampling 需要正确 collective。
-- **DP/DP Attention**：各 rank 请求数和 verify token 数可能不同；graph tier、采样结果和调度反馈需要一致。
-- **EP/MoE**：候选 token 增多会改变 expert routing 负载和 all-to-all 形状。
-- **Paged/Radix Cache**：prefix hit 只覆盖正式前缀；临时候选不能提前插入共享 radix tree。
-- **Chunked prefill**：prefill、draft、verify 争用 token budget；框架需要明确能否混批。
-- **Overlap scheduling**：调度下一轮时当前轮结果未回到 CPU，需 device-side 状态或滞后反馈。
-- **Structured output**：draft 与 target 必须使用同一 grammar mask；接受后 grammar state 按实际提交 token 推进。
-
-## 9. 工业框架现状
-
-框架变化很快。下表只描述截至本文日期的主线能力，不代表所有模型、后端和并行组合都成熟。
-
-| 系统 | 主要能力 | 需要注意 |
+| 实验 | 对照 | 判据 |
 |---|---|---|
-| [SGLang](https://docs.sglang.io/docs/advanced_features/speculative_decoding) | 主线文档列出 EAGLE-2/3、MTP、DFlash、standalone、n-gram；DSpark 的 dev/pinned 路径已集成 ragged verify、confidence scheduling、CUDA Graph 和 overlap | DSpark 仍在完善组合覆盖；其他算法对 DP Attention、PP、chunked prefill 和 backend 也有限制 |
-| [vLLM](https://docs.vllm.ai/en/latest/features/speculative_decoding/) | draft model、EAGLE、MTP、MLP、n-gram、suffix、动态 speculation；共享 speculative metadata 与 rejection sampling 基础设施 | DSpark drafting 与按请求 confidence scheduling 的覆盖需按版本和模型路径核对 |
-| [TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md) | DraftTarget、EAGLE、MTP、n-gram、并行 draft 等硬件优化路径 | 算法存在于 main 不等于稳定 release 的所有组合可用 |
-| [Transformers](https://huggingface.co/docs/transformers/main/en/generation_strategies#speculative-decoding) | assistant model、prompt lookup、early-exit self speculation、Universal Assisted Generation | 适合单机生成 API；batched/在线调度能力不同于 serving engine |
-| [DeepSpec](https://github.com/deepseek-ai/DeepSpec) | DSpark、DFlash、EAGLE-3 的数据准备、target cache、训练和 acceptance 评测 | “full-stack”指 draft 训练评测链，不是完整在线 serving engine |
-| [SpecForge](https://github.com/sgl-project/SpecForge) / [vLLM Speculators](https://docs.vllm.ai/projects/speculators/en/latest/) | 训练、转换和部署 EAGLE/MTP/DFlash/DSpark 等 speculator | 数据生成与 target feature cache 成本高，checkpoint 与 target 强耦合 |
+| Greedy parity | target 原生 decoding | token IDs 完全一致 |
+| Sampling distribution | target 直接采样 | 大样本频率或 KL/TV 在统计误差内 |
+| 首 token/中途/全接受 | 人工构造 $p,q$ | correction、bonus 和后缀丢弃正确 |
+| 稀疏 proposal | dense $q$ rejection | 输出分布一致 |
+| eager vs CUDA Graph | 相同 seed/config | token 与 proposal metadata 一致 |
+| TP 与量化 LM head | TP=1 dense baseline | top-k、path 和输出一致 |
 
-vLLM 的 [`RejectionSampler`](https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/rejection_sampler.py) 是理解工程实现的直接入口：输入 flatten 后的 draft probs、target logits 和 speculative metadata，输出 accepted、recovered 与 bonus tokens。
+### 10.2 问题分解实验
 
-## 10. mini-SGLang 的现状与接入边界
+**实验 A：selector oracle gap**
 
-本文基于 mini-SGLang 提交 `f675880`。当前主线没有投机解码。`python/minisgl/models/qwen3_5_ref.py` 中过滤 `mtp` 权重的代码属于参考模型文件，不构成可执行 MTP 推理链。
+- 指标：每位置 Recall@1、Recall@K、oracle acceptance、真实 selector acceptance。
+- 自变量：$K$、selector rank、领域、温度。
+- 假设：若 Recall@K 高而真实接受率低，瓶颈是 selector；若 Recall@K 本身快速下降，瓶颈是 backbone coverage。
+- 可证伪条件：扩大 $K$ 不提高 oracle acceptance。
 
-### 10.1 当前代码假设
+**实验 B：local convolution**
 
-| 当前代码 | 假设 | 投机解码需要的变化 |
+- 对照：DFlash 5L、5L+static conv、5L+dynamic conv、15L。
+- 指标：分位置 conditional acceptance、draft latency、参数、显存。
+- 假设：卷积主要改善块尾，而非第一个位置。
+- 可证伪条件：收益在所有位置均匀，或来自模型容量而非局部结构。
+
+**实验 C：selector 与 convolution 交互**
+
+- 四组：baseline、selector-only、conv-only、full DFlash 2。
+- 指标：Recall@K、selection gap、acceptance length、cycle latency。
+- 目标：验证两组件是否分别作用于 selection 与 coverage，而不是重复解决同一误差。
+
+**实验 D：训练目标与 exposure shift**
+
+- 对照：unary-only、unary + selector CE（多组 loss 权重）、冻结或联合训练 backbone。
+- 指标：严格 Recall@K、teacher-forced selector accuracy、自回归 selector acceptance。
+- 目标：区分 candidate coverage 与 conditional selection 的收益。
+- 可证伪条件：teacher-forced accuracy 提高，但自回归 acceptance 不变，说明训练候选注入或 teacher forcing 未转化为服务收益。
+
+### 10.3 系统实验
+
+| 维度 | 建议取值 | 主要问题 |
 |---|---|---|
-| [`core.py`](../python/minisgl/core.py) `Batch.phase` | 只有 prefill/decode | 增加 draft/verify 语义或独立 speculative metadata |
-| [`core.py`](../python/minisgl/core.py) `Req.complete_one()` | 每次 Engine forward 都无条件标记现有输入已缓存、再预留一个位置；每个非 chunk 请求只采样一个 token | draft/verify 不能继续无条件调用；应按每请求 committed length 更新，处理 EOS/max_tokens 中途截断 |
-| [`scheduler/decode.py`](../python/minisgl/scheduler/decode.py) | 所有 running request 组成单 token decode batch | 为 draft、verify 分配 token budget 和 lookahead KV |
-| [`scheduler/scheduler.py`](../python/minisgl/scheduler/scheduler.py) | 每请求只写一个 next token | 一次回传 ragged token 列表、接受长度和 KV commit 信息 |
-| [`engine/sample.py`](../python/minisgl/engine/sample.py) | 每请求一行 logits，直接 greedy/采样 | 保存 draft probs；实现 greedy verify 与 residual rejection sampler |
-| [`layers/embedding.py`](../python/minisgl/layers/embedding.py) | decode 对所有 hidden 运行 LM head，prefill 只取末位 | verify 需要为候选节点选择对应 logits；树需节点到 logits 映射 |
-| [`engine/graph.py`](../python/minisgl/engine/graph.py) | graph 只 capture decode，固定 `q_len=1` | capture draft/verify buckets 或 ragged total-token tiers |
-| [`attention/fa.py`](../python/minisgl/attention/fa.py)、[`attention/fi.py`](../python/minisgl/attention/fi.py) | eager prefill 已支持按 `extend_len` 的线性 ragged query；graph decode 固定 `q_len=1`；没有 tree mask | 线性 verify 可复用 prefill metadata，但需增加 verify/LM-head 路由；graph 支持多 query，树形路径新增 ancestor mask 契约 |
-| [`scheduler/cache.py`](../python/minisgl/scheduler/cache.py) | 按 `device_len` 分配正式页，完成后统一缓存/释放 | 增加临时候选槽、commit/rollback，禁止候选提前进入 Radix Cache |
+| block size | 4、8、12、16 | 接受长度增长能否覆盖 verify 成本 |
+| concurrency | 1、8、32、饱和点 | 收益何时因 compute-bound 消失 |
+| context | 短、中、长 | draft KV 与 target feature 成本 |
+| sampling | greedy、低温、高温 | proposal 支持与拒绝率 |
+| top-k/selector dimension | 多组网格 | 质量、top-k latency、codebook 显存 |
+| precision | BF16、FP8、INT4/8 | LM head/top-k/selector 兼容性 |
+| parallelism | TP=1/2/4/8 | `TP × K` 通信与 codebook 复制 |
+| workload | chat、code、math、agent trace | domain shift 和序列熵 |
 
-### 10.2 最小接入方案
+至少报告 draft、top-k、lattice、walk、target verify、rejection 和 KV commit 的分项 latency。只报告平均 acceptance length 无法解释系统收益。
 
-建议先实现线性、greedy、独立 draft model 的单 GPU 版本，再扩展随机采样和树。它不能直接在当前 `Engine` 中再实例化一个模型：`Context` 是只允许设置一次的全局单例，且绑定唯一 KV Cache、page table 和 attention backend。低开销实现应先把它改成可切换的 model-local context，再为 draft model 建立独立 KV/page table/backend；另一种隔离方案是独立 draft worker 进程，但会增加 CUDA context 和通信开销。
+### 10.4 独立复现的最小标准
 
-当前 scheduler 每轮也只发起一次 `_forward()`，`ForwardOutput`、token pool 写回和 detokenize 消息均为单 token 形状。因此还需把 decode loop 改为 `draft -> verify -> commit` 阶段状态机。最小结构为：
+1. 固定 target、prompt 模板、采样参数、输出上限和随机种子。
+2. 使用相同 runtime commit 比较 autoregressive、DFlash、DFlash 2。
+3. 同时给出 correctness、acceptance、per-user speed 和 aggregate throughput。
+4. 区分冷启动、prefill、decode 与稳态服务。
+5. 公布未筛选请求结果和方差，不只报告最佳任务。
+
+## 11. 讨论与开放问题
+
+### 11.1 接受率应被分解
+
+单一 acceptance rate 混合了 candidate coverage、path selection 和 verification truncation 三类因素。三者不是可直接相加的概率事件，而是需要分别测量的诊断维度。
+
+Recall@K 衡量 candidate coverage；oracle path 衡量 selector 上限；分位置曲线衡量 suffix decay；调度器验证长度衡量系统截断。分解后才能判断应该增加 backbone、改 selector，还是减少 verify budget。
+
+### 11.2 离散条件不一定需要重模型自回归
+
+EAGLE、MTP 和 DSpark 都通过某种顺序状态表达已选 token。DFlash 2 表明，若并行 backbone 已产生高 recall 候选，离散条件可以被压缩为低秩局部转移和短 path walk。
+
+这是一种计算重排：
 
 ```text
-SpecConfig
-  method, draft_model_path, num_spec_tokens
-
-Req.spec_state
-  draft_len, verify_len, accepted_len
-  draft_cache_handle, temporary_target_slots
-
-SpecWorker
-  draft(reqs) -> draft_token_ids, draft_probs
-  build_verify_batch(...)
-  verify(target_logits, ...) -> committed_token_ids, accepted_lens
-
-Scheduler
-  allocate lookahead slots
-  run draft -> target verify
-  commit accepted KV / free rejected KV
-  emit ragged results
+昂贵的 V 维自回归预测
+        ->
+一次 V 维并行打分 + 多次 K 维局部选择
 ```
 
-对 mini-SGLang 当前的 decode 状态，线性 verify batch 不能只放 draft token。验证前通常满足 `cached_len = device_len - 1`，因此要先取请求末尾的 `pending_anchor`，构造 `[pending_anchor, draft_0, ..., draft_(K-1)]`，并分配 $K+1$ 个 target KV 槽。验证后提交 anchor 与接受 draft 的 KV，correction/bonus 成为新的 pending anchor。若省略 anchor，第一候选没有对应的 target logits，position 与 KV 也会整体错一位。
+当 $K\ll V$ 时该重排有明显潜力。
 
-一次投机轮会给每个请求返回不同数量的 token；除 Scheduler 外，还要把 `ForwardOutput.next_tokens_*`、device token pool 写回、`DetokenizeMsg.next_token` 改为 ragged 结果，并在流式输出、EOS 和 `max_tokens` 处截断。
+### 11.3 Suffix decay 可能是结构问题
 
-实现顺序：
+五层加局部卷积接近十五层 baseline，提示块尾退化未必要求更大模型。局部依赖有明确结构时，合适的归纳偏置可能比通用 Transformer 容量更有效。
 
-1. 只支持 greedy、固定线性 draft length、eager forward、`page_size=1`。
-2. 建立 token equality、KV commit/rollback 和资源守恒测试。
-3. 加入精确随机 rejection sampling，并做分布统计检验。
-4. 加入 paged lookahead slots、continuous batching、abort/EOS。
-5. 增加 CUDA Graph buckets 与 overlap。
-6. 最后实现 EAGLE tree 或 MTP，避免同时引入模型和系统两类变量。
+需要进一步验证这一结论是否适用于：
 
-树形 EAGLE 不能复用现有普通 causal metadata，需要新的 tree attention backend 契约。DSpark 还需要 per-request ragged verify、confidence calibration 和硬件 cost table，明显不适合作为第一条实现路径。
+- 长距离代码依赖；
+- 多 token 数学表达式；
+- 高熵开放式生成；
+- 不同 tokenizer 粒度。
 
-## 11. 性能、价值与选型
+### 11.4 下一瓶颈是 verification budget
 
-### 11.1 何时有价值
+当 drafter 足够快且候选质量提高后，target 验证会成为主要成本。并发越高，这一问题越突出。未来方法需要联合优化：
 
-- 大 target、batch 较小，单 token decode 明显受权重带宽限制；
-- 代码、数学模板、固定格式等低熵输出，draft-target 重合高；
-- 有与 target、领域和采样配置对齐的 draft checkpoint；
-- 延迟比峰值吞吐更重要，或者系统能动态收缩验证预算；
-- 模型使用昂贵 TP/EP，减少串行 target step 可降低每 token collective 次数。
+$$
+\text{proposal quality}
+\times
+\text{verification allocation}
+\times
+\text{runtime shape}.
+$$
 
-### 11.2 何时可能变慢
+DFlash 2 提高第一项 proposal quality，但没有原生解决按请求动态验证长度。与 DSpark confidence scheduling、ragged CUDA Graph 和负载感知 cost model 结合，是直接方向。
 
-- 高 QPS 下 target 已 compute-bound；
-- target 很小，单步本来就快；
-- 开放式文本、高温采样或 domain shift 导致接受率低；
-- draft 太大、跨设备通信或 tokenizer 转换开销高；
-- tree/block 太大，LM head、attention、KV 和 sampling 开销超过收益；
-- graph/backend 不支持多 token verify，只能退回低效 eager 路径。
+### 11.5 稀疏 proposal 尚未被充分利用
 
-### 11.3 简单选型
+selector 天然输出 top-k 稀疏 $q$，但当前部分实现将其展开为全词表 dense buffer。更合理的 verifier 可以：
 
-| 条件 | 优先尝试 |
-|---|---|
-| checkpoint 原生包含 MTP，且框架支持该模型的 native MTP | MTP；通常集成改动最少 |
-| 普通 target 有成熟配套 checkpoint | EAGLE-3；兼顾接受长度和生态支持 |
-| 高并发且固定长块浪费严重 | DSpark 或其他动态 verify length 方法 |
-| prompt/输出高度重复且无训练预算 | prompt lookup、n-gram、suffix 或 REST |
-| 不能加载第二套模型 | self-speculation、LayerSkip、Lookahead |
-| 需要最容易验证的教学实现 | 小 draft model + 线性 speculative sampling |
+- 直接计算 selected token 的 $q(y)$；
+- 以稀疏修正表示 residual；
+- 将 target top-k 与 proposal support 融合；
+- 避免 `[B,L,V]` buffer 的初始化和清零。
 
-## 12. 评测方法
+难点是 residual distribution 仍可能在完整 target 词表上有质量，因此需要精确、可并行的补分布采样。
 
-### 12.1 必报指标
+### 11.6 开放问题
 
-- draft acceptance rate 和分位置接受率；
-- accepted draft tokens 与 emitted tokens per cycle；
-- draft、target verify、sampling、scheduler 分项 latency；
-- TTFT、TPOT/ITL、端到端 latency 与 p50/p95/p99；
-- aggregate throughput、goodput 和达到的并发；
-- target verified tokens、rejected tokens 和验证利用率；
-- target/draft 权重、KV、临时候选和 CUDA Graph 峰值显存。
+- selector 能否使用更长依赖而不恢复昂贵自回归？
+- 局部 greedy walk 与全局路径搜索的收益/延迟边界在哪里？
+- top-k 能否按位置或请求动态变化？
+- confidence 是否可以同时预测 candidate coverage 和 expected system gain？
+- codebook 能否低比特量化、分片或按频率缓存？
+- drafter 能否与 target 联合训练，使 Recall@K 而非 cross-entropy 成为直接目标？
+- grammar、structured output 和 tool-call 约束应在候选生成还是验证阶段注入？
 
-只报告平均接受长度不足以证明加速。至少同时给出硬件、模型与精度、draft 配置、batch/QPS、输入/输出长度、数据集、temperature/top-k/top-p 和 baseline 版本。
+## 12. 资料与阅读顺序
 
-### 12.2 正确性矩阵
+### 12.1 核心论文
 
-| 测试 | 验证目标 |
-|---|---|
-| greedy no-spec vs spec | 全部 token IDs 完全相同 |
-| sampling 大样本频率 | rejection sampler 输出收敛到 target 分布 |
-| 全接受/首 token 拒绝/中途拒绝 | correction、bonus 和后缀丢弃正确 |
-| 跨 page 边界 | commit/rollback 后 page table 与 KV 正确 |
-| batch 内不同接受长度 | ragged advancement 与输出顺序正确 |
-| EOS/max_tokens 出现在接受块中 | 不输出终止点后的 token，释放多余 KV |
-| 新请求进入、请求完成、abort、reorder | continuous batching 无状态串扰或泄漏 |
-| eager vs CUDA Graph | 输出和 speculative metadata 一致 |
-| prefix cache hit | 临时候选不污染共享 Radix Cache |
-| TP/DP/EP | rank 间接受结果、长度、page ownership 一致 |
-| 不同 temperature/top-k/top-p/seed | 采样变换与 draft/target 概率匹配 |
-
-### 12.3 性能矩阵
-
-至少横跨：
-
-- batch/QPS：1、低并发、中并发、饱和；
-- 上下文：短、中、长；
-- 领域：chat、code、math、摘要/复制；
-- sampling：greedy、低温、高温；
-- draft length/tree size：从短到超过最优点；
-- eager/graph、同步/overlap、prefix hit/miss；
-- 单 GPU、TP、DP/EP 组合。
-
-目标是画出 `throughput - per-user decode speed` Pareto frontier，而不是寻找一个脱离负载的最大倍数。
-
-## 13. 常见误区
-
-1. **“一次 target forward 等价于免费验证任意多个 token。”** 验证 latency 会随 query token 数、树大小和 batch 增长。
-2. **“投机解码节省计算量。”** 它常增加总 FLOPs，利用的是 decode 的带宽瓶颈和空闲并行算力。
-3. **“小模型越大，接受率越高，所以越快。”** drafter 大小、对齐程度和 latency 需要共同优化。
-4. **“MTP 可以直接输出多个正确 token。”** MTP 只提供候选，仍需 target verification。
-5. **“EAGLE-2 是新的 draft model。”** 它主要是 EAGLE-1 上的动态树策略。
-6. **“EAGLE-3 不再使用 feature。”** 它仍由多层 target feature 条件化，只取消 feature regression。
-7. **“候选 concat 后跑普通 causal attention 即可。”** 多请求需要 varlen 边界，树需要 ancestor-only mask。
-8. **“验证产生的 KV 全部可缓存。”** 只能提交接受路径；拒绝后缀和兄弟分支必须回收。
-9. **“Greedy 对齐就证明 sampling 无损。”** 随机路径还需 residual rejection sampling 和统计检验。
-10. **“论文最大 speedup 可以横向比较。”** 模型、硬件、offloading、batch、任务、基线和指标通常不同。
-
-## 14. 推荐资料
-
-### 14.1 入门与综述
-
-- [Unlocking Efficiency in Large Language Model Inference: A Comprehensive Survey of Speculative Decoding](https://aclanthology.org/2024.findings-acl.456/)
-- [Speculative Decoding and Beyond: An In-Depth Survey](https://arxiv.org/abs/2502.19732)
-- [COLING 2025 Tutorial: Speculative Decoding for Efficient LLM Inference](https://speculative-decoding.github.io/)
-- [Google Research: Looking Back at Speculative Decoding](https://research.google/blog/looking-back-at-speculative-decoding/)
-- [Hugging Face Assisted Generation](https://huggingface.co/docs/transformers/main/en/generation_strategies#speculative-decoding)
-
-### 14.2 核心论文
-
-- [Leviathan et al.: Fast Inference from Transformers via Speculative Decoding](https://proceedings.mlr.press/v202/leviathan23a.html)
-- [Chen et al.: Accelerating LLM Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318)
-- [SpecInfer](https://arxiv.org/abs/2305.09781)
-- [DistillSpec](https://arxiv.org/abs/2310.08461)
-- [Medusa](https://arxiv.org/abs/2401.10774)
-- [Sequoia](https://arxiv.org/abs/2402.12374)
-- [MagicDec](https://arxiv.org/abs/2408.11049)
-
-### 14.3 EAGLE、MTP、DFlash、DSpark
-
+- [Speculative Decoding 综合综述](https://aclanthology.org/2024.findings-acl.456/)
+- [Speculative Decoding and Beyond: An In-depth Survey](https://arxiv.org/abs/2502.19732)
+- [COLING 2025 Speculative Decoding Tutorial](https://speculative-decoding.github.io/)
+- [Google Research：Looking Back at Speculative Decoding](https://research.google/blog/looking-back-at-speculative-decoding/)
+- [Hugging Face assisted generation 文档](https://huggingface.co/docs/transformers/main/en/generation_strategies#speculative-decoding)
+- [Fast Inference from Transformers via Speculative Decoding](https://proceedings.mlr.press/v202/leviathan23a.html)
+- [Accelerating Large Language Model Decoding with Speculative Sampling](https://arxiv.org/abs/2302.01318)
+- [DistillSpec](https://arxiv.org/abs/2310.08461)、[MagicDec](https://arxiv.org/abs/2408.11049)
 - [EAGLE-1](https://arxiv.org/abs/2401.15077)、[EAGLE-2](https://arxiv.org/abs/2406.16858)、[EAGLE-3](https://arxiv.org/abs/2503.01840)
-- [EAGLE 官方实现](https://github.com/SafeAILab/EAGLE)
-- [Better & Faster LLMs via Multi-token Prediction](https://arxiv.org/abs/2404.19737)
-- [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437) 与 [权重结构](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/README_WEIGHTS.md)
+- [Better & Faster Large Language Models via Multi-token Prediction](https://arxiv.org/abs/2404.19737)
+- [DeepSeek-V3 Technical Report](https://arxiv.org/abs/2412.19437)
 - [DFlash](https://arxiv.org/abs/2602.06036)
 - [DSpark](https://arxiv.org/abs/2607.05147)
-- [DeepSeek DeepSpec](https://github.com/deepseek-ai/DeepSpec)
 
-### 14.4 系统与代码
+### 12.2 DFlash 2 一手资料
 
-- [SGLang Speculative Decoding](https://docs.sglang.io/docs/advanced_features/speculative_decoding)
+- [DFlash 2: Keep Drafting Parallel](https://inco.ai/blog/dflash2/)
+- [DFlash 官方仓库](https://github.com/z-lab/dflash)
+- [DFlash 2 checkpoint collection](https://huggingface.co/collections/z-lab/dflash-2)
+- [Qwen3.8-27B DFlash 2 model card](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
+- [Muse Glimmer DFlash 2 model card](https://huggingface.co/z-lab/Muse-Glimmer-30B-DFlash2)
+- [SGLang DFlash 2 PR #35371](https://github.com/sgl-project/sglang/pull/35371)
+- [vLLM DFlash 2 PR #52816](https://github.com/vllm-project/vllm/pull/52816)
+- [llama.cpp DFlash 2 PR #27342](https://github.com/ggml-org/llama.cpp/pull/27342)
+- [SpecForge DFlash 2 training PR #772](https://github.com/sgl-project/SpecForge/pull/772)
+- [vLLM Speculators experimental training PR #1006](https://github.com/vllm-project/speculators/pull/1006)
+- [DeepSpec：DFlash、DSpark、EAGLE-3 训练与评测](https://github.com/deepseek-ai/DeepSpec)
+- [SpecForge：speculator 训练框架](https://github.com/sgl-project/SpecForge)
+
+### 12.3 工业框架与可运行实现
+
+- [EAGLE 官方实现](https://github.com/SafeAILab/EAGLE)
+- [DeepSeek-V3 权重结构说明](https://github.com/deepseek-ai/DeepSeek-V3/blob/main/README_WEIGHTS.md)
+- [SGLang speculative decoding 文档](https://docs.sglang.io/docs/advanced_features/speculative_decoding)
 - [SGLang speculative runtime 源码](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/speculative)
-- [SGLang DSpark 系统实现](https://www.lmsys.org/blog/2026-07-06-dspark-sglang/)
-- [vLLM Speculative Decoding](https://docs.vllm.ai/en/latest/features/speculative_decoding/)
-- [vLLM Rejection Sampler](https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/rejection_sampler.py)
+- [SGLang DSpark 系统实现说明](https://www.lmsys.org/blog/2026-07-06-dspark-sglang/)
+- [vLLM speculative decoding 文档](https://docs.vllm.ai/en/latest/features/speculative_decoding/)
+- [vLLM rejection sampler](https://github.com/vllm-project/vllm/blob/main/vllm/v1/sample/rejection_sampler.py)
 - [vLLM Speculators](https://docs.vllm.ai/projects/speculators/en/latest/)
-- [TensorRT-LLM Speculative Decoding](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md)
-- [Prompt Lookup Decoding](https://github.com/apoorvumang/prompt-lookup-decoding)
-- [REST 官方实现](https://github.com/FasterDecoding/REST)
-- [Lookahead Decoding 官方实现](https://github.com/hao-ai-lab/LookaheadDecoding)
-- [教学版 Speculative Decoding](https://github.com/romsto/Speculative-Decoding)
+- [TensorRT-LLM speculative decoding](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/speculative-decoding.md)
+- [REST](https://github.com/FasterDecoding/REST)、[Lookahead Decoding](https://github.com/hao-ai-lab/LookaheadDecoding)、[教学版实现](https://github.com/romsto/Speculative-Decoding)
 
-## 15. 推荐学习顺序
+### 12.4 建议阅读顺序
 
-1. 手写线性 greedy verifier，理解“并行算 logits、串行确认前缀”。
-2. 实现修正拒绝采样，用小词表 Monte Carlo 验证输出分布等于 $p$。
-3. 阅读 vLLM rejection sampler，理解 flatten metadata、accepted/recovered/bonus token。
-4. 手写两层 token tree 的 ancestor mask，检查 flatten 前后 logits 一致。
-5. 跟踪一次 SGLang EAGLE 的 draft、tree build、target verify、KV commit。
-6. 阅读 DeepSeek-V3 MTP module，区分训练目标、drafter 与 verifier。
-7. 对比 EAGLE-3、DFlash、DSpark 的 `draft latency - accepted length` Pareto frontier。
-8. 最后研究 continuous batching、paged lookahead KV、CUDA Graph 与负载感知验证调度。
+1. 精确 speculative sampling：理解 proposal、接受概率和 residual。
+2. EAGLE/MTP：理解离散 token 条件为什么重要。
+3. DFlash：理解并行 block drafter 与 target feature injection。
+4. DFlash 2 博客和 `model.py`：理解 selector 与 convolution。
+5. SGLang worker/kernel：理解 KV、TP、CUDA Graph 和 rejection 的真实代价。
 
-完成标准不是记住论文倍数，而是能够对任意实现回答四个问题：候选如何产生，target 如何验证，KV 如何提交/回滚，什么负载下端到端收益为正。
+阅读任意实现时应回答五个问题：
+
+1. 候选由什么信息产生？
+2. 块内实际选中 token 如何影响后续候选？
+3. target 如何验证并恢复精确分布？
+4. KV 如何提交和回滚？
+5. 在什么 batch、硬件和采样条件下端到端收益为正？
